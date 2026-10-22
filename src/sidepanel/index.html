@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FastPilot</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <form id="task-form">
+      <textarea id="task" rows="3" placeholder="What should I do on this page?" required></textarea>
+      <div class="row">
+        <button id="run" type="submit">Run</button>
+        <button id="stop" type="button" hidden>Stop</button>
+        <button id="snap" type="button" class="secondary" title="Show what the model sees on this page">Snapshot</button>
+        <button id="clear" type="button" class="secondary">Clear</button>
+      </div>
+    </form>
+
+    <ol id="log"></ol>
+
+    <details id="settings">
+      <summary>Settings</summary>
+      <label>Provider
+        <select id="preset">
+          <option value="">Custom</option>
+          <option value="https://api.openai.com/v1">OpenAI</option>
+          <option value="https://openrouter.ai/api/v1">OpenRouter</option>
+          <option value="https://api.groq.com/openai/v1">Groq</option>
+          <option value="https://api.cerebras.ai/v1">Cerebras</option>
+          <option value="https://api.together.xyz/v1">Together</option>
+          <option value="http://localhost:11434/v1">Ollama (local)</option>
+          <option value="http://localhost:1234/v1">LM Studio (local)</option>
+        </select>
+      </label>
+      <label>Base URL <input id="baseUrl" type="url" spellcheck="false" /></label>
+      <label>Model <input id="model" list="models" spellcheck="false" placeholder="model id, must support tool calling" /></label>
+      <datalist id="models">
+        <option value="anthropic/claude-haiku-5.5"></option>
+        <option value="google/gemini-3.8-flash"></option>
+        <option value="deepseek/deepseek-v4.1-flash"></option>
+        <option value="qwen/qwen3.8-flash"></option>
+      </datalist>
+      <label>API key <input id="apiKey" type="password" autocomplete="off" placeholder="sk-or-… (openrouter.ai/keys)" /></label>
+      <label>Speed
+        <select id="speed">
+          <option value="instant">Instant: teleport and paste</option>
+          <option value="fast">Fast: quick human-like moves</option>
+          <option value="natural">Natural: human pace</option>
+        </select>
+      </label>
+      <label>Max steps <input id="maxSteps" type="number" min="1" max="200" /></label>
+      <label class="check"><input id="replay" type="checkbox" /> Replay saved runs without the model</label>
+      <label>Jev (TypeSafe)
+        <select id="jev">
+          <option value="off">Off</option>
+          <option value="shadow">Shadow: log what Jev would do</option>
+          <option value="finish">Finish: end the run when Jev is sure it's done</option>
+        </select>
+      </label>
+      <label>Jev model <input id="jevModel" spellcheck="false" /></label>
+      <p class="hint">Jev uses your OpenRouter key, so it needs OpenRouter as the provider. It never clicks or types: in finish mode it can only end a run. Saved in this browser only.</p>
+    </details>
+
+    <details id="runs">
+      <summary>Saved runs (<span id="runs-count">0</span>)</summary>
+      <p class="hint">A run is saved when a task finishes. Running the exact same task on the same site replays it, then the model checks the result. If a step fails, the model takes over and the saved run is updated.</p>
+      <ul id="runs-list"></ul>
+      <button id="clear-runs" type="button" class="secondary">Delete all</button>
+    </details>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

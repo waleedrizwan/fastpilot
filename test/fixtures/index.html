@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>FastPilot test page</title>
+    <style>
+      body { font: 15px system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+      label { display: block; margin: 10px 0 4px; }
+      input, select { padding: 6px; font: inherit; }
+      .fancy-check input { opacity: 0; position: absolute; }
+      .fancy-check span::before { content: '☐ '; }
+      .fancy-check input:checked + span::before { content: '☑ '; }
+      [role=combobox] { border: 1px solid #999; padding: 6px; width: 200px; cursor: pointer; }
+      [role=listbox] { border: 1px solid #999; width: 212px; }
+      [role=option] { padding: 6px; cursor: pointer; }
+      [role=option]:hover { background: #eef; }
+      #result { margin-top: 16px; padding: 10px; background: #efe; display: none; }
+      .spacer { height: 1400px; }
+    </style>
+  </head>
+  <body>
+    <h1>Order form</h1>
+    <form id="f">
+      <label for="name">Full name</label>
+      <input id="name" />
+      <label for="email">Email</label>
+      <input id="email" type="email" placeholder="you@example.com" />
+      <label for="country">Country</label>
+      <select id="country">
+        <option value="">Choose…</option>
+        <option value="ca">Canada</option>
+        <option value="us">United States</option>
+        <option value="uk">United Kingdom</option>
+      </select>
+
+      <label>Size (custom dropdown)</label>
+      <div id="size" role="combobox" aria-expanded="false" tabindex="0">Pick a size</div>
+      <div id="size-list" role="listbox" hidden>
+        <div role="option">Small</div>
+        <div role="option">Medium</div>
+        <div role="option">Large</div>
+      </div>
+
+      <label class="fancy-check"><input type="checkbox" id="gift" /><span>Gift wrap</span></label>
+      <p><button type="submit">Place order</button></p>
+    </form>
+    <div id="result"></div>
+
+    <h2>Recommendations</h2>
+    <ul id="recs"><li>Loading…</li></ul>
+
+    <div class="spacer"></div>
+    <h2>Way down here</h2>
+    <button id="secret" type="button">Reveal code</button>
+    <p id="code"></p>
+
+    <script>
+      const combo = document.getElementById('size');
+      const list = document.getElementById('size-list');
+      // Opens on pointerdown, like many component libraries; a bare element.click() won't open it.
+      combo.addEventListener('pointerdown', () => {
+        list.hidden = !list.hidden;
+        combo.setAttribute('aria-expanded', String(!list.hidden));
+      });
+      list.addEventListener('click', (e) => {
+        if (e.target.getAttribute('role') !== 'option') return;
+        combo.textContent = e.target.textContent;
+        list.hidden = true;
+        combo.setAttribute('aria-expanded', 'false');
+      });
+
+      document.getElementById('f').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const out = document.getElementById('result');
+        out.style.display = 'block';
+        out.textContent = 'Submitting…';
+        setTimeout(() => {
+          const v = (id) => document.getElementById(id).value;
+          out.textContent = `Order placed for ${v('name')} <${v('email')}>, country=${v('country')}, size=${combo.textContent}, gift=${document.getElementById('gift').checked}`;
+        }, 500);
+      });
+
+      setTimeout(() => {
+        document.getElementById('recs').innerHTML = ['Blue mug', 'Notebook', 'Desk lamp'].map((t) => `<li><a href="#${t}">${t}</a></li>`).join('');
+      }, 800);
+
+      document.getElementById('secret').addEventListener('click', () => {
+        document.getElementById('code').textContent = 'The code is 4417.';
+      });
+    </script>
+  </body>
+</html>

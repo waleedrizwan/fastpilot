@@ -1,0 +1,20 @@
+# Dependencies and build output
+node_modules
+dist
+
+# Gauntlet results and run reports (agent logs from your own runs)
+testbed/.data
+
+# Secrets: API keys go in your environment or a local .env, never in the repo
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local editor, OS and tool files
+.DS_Store
+*.log
+.vscode
+.idea
+.claude/settings.local.json

@@ -1,0 +1,31 @@
+// Imports every route module so each registers its routes and challenges.
+
+import './api.ts';
+import './catalog.ts';
+import './home.ts';
+import './shop.ts';
+import './account.ts';
+import './support.ts';
+import './blog.ts';
+import './app.ts';
+import '../lab/kit.ts';
+import '../lab/clicks.ts';
+import '../lab/frames.ts';
+import '../lab/text.ts';
+import '../lab/choices.ts';
+import '../lab/ranges.ts';
+import '../lab/files.ts';
+import '../lab/drag.ts';
+import '../lab/keyboard.ts';
+import '../lab/hover.ts';
+import '../lab/scroll.ts';
+import '../lab/timing.ts';
+import '../lab/dialogs.ts';
+import '../lab/windows.ts';
+import '../lab/nav.ts';
+import '../lab/forms.ts';
+import '../lab/reading.ts';
+import '../lab/visual.ts';
+import '../lab/adversarial.ts';
+import '../lab/stress.ts';
+import '../lab/locale.ts';

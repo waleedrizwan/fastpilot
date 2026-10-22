@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "FastPilot",
+  "version": "0.1.0",
+  "description": "Fast, model-agnostic browser automation agent.",
+  "minimum_chrome_version": "116",
+  "background": { "service_worker": "src/background/index.ts", "type": "module" },
+  "side_panel": { "default_path": "src/sidepanel/index.html" },
+  "action": { "default_title": "Open FastPilot" },
+  "permissions": ["sidePanel", "debugger", "tabs", "scripting", "storage"],
+  "host_permissions": ["<all_urls>"]
+}

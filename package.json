@@ -1,0 +1,22 @@
+{
+  "name": "fastpilot",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "fixture": "vite test/fixtures --port 5174",
+    "testbed": "node testbed/server.ts",
+    "gauntlet": "node testbed/runner.ts",
+    "test": "node --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@crxjs/vite-plugin": "^2.7.1",
+    "@types/chrome": "^0.3.6",
+    "@types/node": "^26.6.5",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.5"
+  }
+}
