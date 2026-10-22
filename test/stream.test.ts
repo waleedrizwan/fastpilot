@@ -96,3 +96,33 @@ test('retries rate limits and drops optional fields the server rejects', async (
     globalThis.fetch = real;
   }
 });
+
+test('stop before the response starts returns an empty, stopped reply instead of throwing', async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = ((_url: unknown, init: RequestInit) => new Promise((_resolve, reject) => {
+    init.signal!.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  })) as typeof fetch;
+  try {
+    const stop = new AbortController();
+    const provider = new OpenAICompatProvider({ baseUrl: 'http://localhost:9/stop-test/v1', apiKey: '', model: 'm' });
+    const pending = provider.chat({ messages: [], tools: [], signal: new AbortController().signal, stop: stop.signal });
+    stop.abort();
+    const res = await pending;
+    assert.equal(res.stopped, true);
+    assert.deepEqual(res.toolCalls, []);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+test('streams text and each tool call as it is written, for the live view', async () => {
+  const seen: string[] = [];
+  await parseStream(sse([
+    { choices: [{ delta: { content: 'Filling.' } }] },
+    tc(0, { name: 'type', arguments: '{"why":"enter name",' }, 'a'),
+    tc(0, { arguments: '"ref":1,"text":"Jo"}' }),
+  ]), {
+    onDelta: (d) => seen.push('text' in d ? `text:${d.text}` : 'call' in d ? `call:${d.call.name}:${d.call.arguments}` : 'reasoning'),
+  });
+  assert.deepEqual(seen, ['text:Filling.', 'call:type:{"why":"enter name",', 'call:type:{"why":"enter name","ref":1,"text":"Jo"}']);
+});

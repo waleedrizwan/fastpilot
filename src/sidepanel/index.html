@@ -17,6 +17,13 @@
       </div>
     </form>
 
+    <section id="now" hidden aria-live="polite">
+      <div class="now-head"><span id="now-step"></span><span id="now-status"></span></div>
+      <div id="now-jev" hidden></div>
+      <ol id="now-calls"></ol>
+      <p id="now-text" hidden></p>
+    </section>
+
     <ol id="log"></ol>
 
     <details id="settings">
@@ -51,6 +58,8 @@
       </label>
       <label>Max steps <input id="maxSteps" type="number" min="1" max="200" /></label>
       <label class="check"><input id="replay" type="checkbox" /> Replay saved runs without the model</label>
+      <label class="check"><input id="showInput" type="checkbox" /> Show the mouse and keyboard on the page</label>
+      <label class="check"><input id="ownWindow" type="checkbox" /> Run tasks in their own window, so you can keep browsing</label>
       <label>Jev (TypeSafe)
         <select id="jev">
           <option value="off">Off</option>

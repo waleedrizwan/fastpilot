@@ -56,6 +56,31 @@ button {
 }
 button.secondary { background: var(--panel); color: var(--fg); border: 1px solid var(--line); }
 #stop { background: var(--err); }
+#now {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--panel);
+  font-size: 13px;
+}
+#now.finished { border-left-color: var(--muted); opacity: .85; }
+.now-head { display: flex; gap: 8px; align-items: baseline; }
+#now-step { font-weight: 600; }
+#now-status { color: var(--muted); }
+#now.busy #now-status::after { content: ' …'; }
+#now-jev { margin-top: 6px; color: var(--muted); }
+#now-jev .bar { display: inline-block; vertical-align: middle; width: 60px; height: 6px; border-radius: 3px; background: var(--line); margin: 0 6px; overflow: hidden; }
+#now-jev .bar span { display: block; height: 100%; background: var(--accent); }
+#now-calls { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+#now-calls li { display: flex; flex-direction: column; }
+#now-calls .what::before { content: attr(data-state); display: inline-block; min-width: 58px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
+#now-calls .what[data-state="running"]::before { color: var(--accent); }
+#now-calls .what[data-state="done"]::before { color: var(--ok); }
+#now-calls .what[data-state="failed"]::before { color: var(--err); }
+#now-calls .why { color: var(--muted); padding-left: 58px; }
+#now-text { margin: 6px 0 0; color: var(--muted); font-style: italic; white-space: pre-wrap; }
 #log {
   list-style: none;
   margin: 0;

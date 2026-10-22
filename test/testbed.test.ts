@@ -125,3 +125,36 @@ test('agent runs hide the challenge status, result and expected outcome', async 
   const css = await (await fetch(`${run.main}/static/css/site.css`)).text();
   for (const sel of ['.cs-status', '.cs-result', '.cs-expect', '.toast-result']) assert.ok(css.includes(`.agent-run ${sel}`), sel);
 });
+
+test('the bridge refuses calls without its header, and hands a job from the runner to FastPilot and back', async () => {
+  const call = (path: string, body: object, header = true) => fetch(run.main + path, {
+    method: 'POST', body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json', ...(header ? { 'X-Gauntlet-Bridge': '1' } : {}) },
+  });
+  // What a web page could send without a preflight: no custom header.
+  assert.equal((await call('/api/bridge/enqueue', { job: { kind: 'reload' } }, false)).status, 403);
+
+  const { id } = await (await call('/api/bridge/enqueue', { job: { kind: 'visit', url: `${run.main}/` } })).json();
+  const hello = { version: '0.1.0', settings: { model: 'm' }, hasKey: true };
+  const poll = await (await call('/api/bridge/poll', { hello, running: null })).json();
+  assert.equal(poll.job.id, id);
+  assert.equal(poll.runnerActive, true);
+  assert.equal((await (await call('/api/bridge/poll', { hello, running: null })).json()).job, null);
+
+  await call('/api/bridge/event', { job: id, events: [{ kind: 'info', text: 'hi' }], done: true });
+  const events = await (await call('/api/bridge/events', { job: id, after: 0 })).json();
+  assert.deepEqual(events, { events: [{ kind: 'info', text: 'hi' }], done: true });
+  const status = await (await call('/api/bridge/status', {})).json();
+  assert.equal(status.connected, true);
+  assert.equal(status.hello.version, '0.1.0');
+});
+
+test('the start page sets the agent and consent cookies only when asked', async () => {
+  const c = challenges().find((x) => x.id === 'lab/clicks/basic')!;
+  const plain = await fetch(`${run.main}/challenges/start/${c.id}`, { redirect: 'manual' });
+  assert.ok(!plain.headers.getSetCookie().some((h) => h.startsWith('gauntlet_agent=')));
+  const agent = await fetch(`${run.main}/challenges/start/${c.id}?agent=1&consent=necessary`, { redirect: 'manual' });
+  const cookies = agent.headers.getSetCookie();
+  assert.ok(cookies.some((h) => h.startsWith('gauntlet_agent=1')));
+  assert.ok(cookies.some((h) => h.startsWith('consent=necessary')));
+});

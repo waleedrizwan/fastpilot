@@ -16,6 +16,9 @@ export interface ToolSpec {
   function: { name: string; description: string; parameters: object };
 }
 
+/** One streamed piece, for showing the model's work as it happens. `call` is the tool call written so far. */
+export type StreamDelta = { text: string } | { reasoning: string } | { call: { index: number; name: string; arguments: string } };
+
 export interface ChatRequest {
   messages: ChatMessage[];
   tools: ToolSpec[];
@@ -24,6 +27,8 @@ export interface ChatRequest {
   stop?: AbortSignal;
   /** Fires as soon as each tool call has fully streamed, before the response ends. */
   onToolCall?: (call: ToolCall) => void;
+  /** Fires on every streamed piece: reply text, reasoning (when the provider streams it), or a tool call so far. */
+  onDelta?: (d: StreamDelta) => void;
   /** Fires before a failed request is retried. */
   onRetry?: (reason: string, waitMs: number) => void;
 }

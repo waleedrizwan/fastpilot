@@ -1,6 +1,7 @@
 // Imports every route module so each registers its routes and challenges.
 
 import './api.ts';
+import './bridge.ts';
 import './catalog.ts';
 import './home.ts';
 import './shop.ts';

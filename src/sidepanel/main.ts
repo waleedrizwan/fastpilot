@@ -1,4 +1,4 @@
-import { loadSettings, needsApiKey, saveSettings, type LogEvent, type PanelMsg, type Settings } from '../shared/types';
+import { loadSettings, needsApiKey, saveSettings, type LiveStep, type LogEvent, type PanelMsg, type Settings } from '../shared/types';
 import { deleteRecording, listRecordings } from '../shared/recordings';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -14,6 +14,49 @@ const send = (m: PanelMsg) => port.postMessage(m);
 function setRunning(on: boolean) {
   runBtn.hidden = on;
   stopBtn.hidden = !on;
+}
+
+// The live card: the current step as it happens, replaced by each 'live' event.
+const now = $<HTMLElement>('now');
+
+function renderLive(l: LiveStep) {
+  now.hidden = false;
+  now.classList.remove('finished');
+  now.classList.toggle('busy', !/finished|complete/.test(l.status));
+  $('now-step').textContent = `Step ${l.step}`;
+  $('now-status').textContent = l.status;
+
+  const jev = $('now-jev');
+  jev.hidden = !l.jev;
+  if (l.jev) {
+    if (l.jev.error) jev.textContent = `Jev: ${l.jev.error}`;
+    else {
+      const pick = `${l.jev.next ?? '?'}${l.jev.target ? ` ${l.jev.target}` : ''}`;
+      const bar = (p = 0) => { const b = document.createElement('span'); b.className = 'bar'; const f = document.createElement('span'); f.style.width = `${Math.round(p * 100)}%`; b.append(f); return b; };
+      jev.replaceChildren(`Jev ${l.jev.ms}ms · would ${pick}`, bar(l.jev.nextP), `${(l.jev.nextP ?? 0).toFixed(2)} · done`, bar(l.jev.done), (l.jev.done ?? 0).toFixed(2));
+    }
+  }
+
+  $('now-calls').replaceChildren(...l.calls.map((c) => {
+    const li = document.createElement('li');
+    const what = document.createElement('span');
+    what.className = 'what';
+    what.dataset.state = c.state;
+    what.textContent = `${c.name}${c.target ? ` ${c.target}` : ''}`;
+    li.append(what);
+    if (c.why) {
+      const why = document.createElement('span');
+      why.className = 'why';
+      why.textContent = `because: ${c.why}`;
+      li.append(why);
+    }
+    return li;
+  }));
+
+  const text = $('now-text');
+  const said = [l.reasoning, l.text].filter((s) => s.trim()).join('\n').trim();
+  text.hidden = !said;
+  text.textContent = said.length > 400 ? `…${said.slice(-400)}` : said;
 }
 
 function append(e: LogEvent) {
@@ -34,14 +77,20 @@ function append(e: LogEvent) {
 }
 
 port.onMessage.addListener((e: LogEvent) => {
-  if (e.kind === 'idle') setRunning(false);
-  else append(e);
+  if (e.kind === 'idle') {
+    setRunning(false);
+    now.classList.add('finished');
+    now.classList.remove('busy');
+  } else if (e.kind === 'live') {
+    if (e.live) renderLive(e.live);
+  } else append(e);
 });
 
 form.addEventListener('submit', (ev) => {
   ev.preventDefault();
   const t = task.value.trim();
   if (!t) return;
+  now.hidden = true;
   append({ kind: 'info', text: `▶ ${t}` });
   setRunning(true);
   send({ type: 'run', task: t });
@@ -70,6 +119,10 @@ async function initSettings() {
   for (const f of fields) $<HTMLInputElement>(f).value = String(s[f]);
   const replay = $<HTMLInputElement>('replay');
   replay.checked = s.replay;
+  const showInput = $<HTMLInputElement>('showInput');
+  showInput.checked = s.showInput;
+  const ownWindow = $<HTMLInputElement>('ownWindow');
+  ownWindow.checked = s.ownWindow;
   syncPreset();
   const save = async () => {
     const next = { ...s } as Settings;
@@ -78,11 +131,15 @@ async function initSettings() {
       (next as any)[f] = f === 'maxSteps' ? Math.max(1, Number(v) || 40) : v;
     }
     next.replay = replay.checked;
+    next.showInput = showInput.checked;
+    next.ownWindow = ownWindow.checked;
     Object.assign(s, next);
     await saveSettings(next);
   };
   for (const f of fields) $(f).addEventListener('change', () => { syncPreset(); save(); });
   replay.addEventListener('change', save);
+  showInput.addEventListener('change', save);
+  ownWindow.addEventListener('change', save);
   preset.addEventListener('change', () => {
     if (!preset.value) return;
     $<HTMLInputElement>('baseUrl').value = preset.value;

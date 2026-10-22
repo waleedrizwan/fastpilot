@@ -2,11 +2,12 @@
 // Actions start as soon as each tool call finishes streaming, while the
 // model is still writing the rest of its reply.
 
-import { isOpenRouter, needsApiKey, type JevShadow, type LogEvent, type Settings, type TurnStats } from '../shared/types';
+import { isOpenRouter, needsApiKey, type JevShadow, type LiveStep, type LogEvent, type Settings, type TurnStats } from '../shared/types';
 import { RECORDABLE, getRecording, recordingKey, saveRecording, stepSummary, type RecordedStep, type Recording } from '../shared/recordings';
 import { describeTarget } from '../content/snapshot';
 import { TabDebugger } from './cdp';
 import { Jev, describeShadow, modelChoice } from './jev';
+import { show } from './overlay';
 import { OpenAICompatProvider } from './llm/openaiCompat';
 import type { ChatMessage, LLMProvider, ToolCall } from './llm/types';
 import { activeTab, inPage, snapshot } from './page';
@@ -14,6 +15,25 @@ import { replay } from './replay';
 import { TOOLS, runTool, type ToolResult } from './tools';
 
 const HISTORY_LIMIT = 24;
+/** Live step updates go out at most this often while the model streams. */
+const LIVE_MS = 80;
+
+/** Element labels by ref, from a snapshot's `[ref] kind "label"` lines. */
+function labels(snap: string): Map<number, string> {
+  const out = new Map<number, string>();
+  for (const line of snap.split('\n')) {
+    const m = /^\[(\d+)\] (\S+)(?: "([^"]*)")?/.exec(line);
+    if (m) out.set(Number(m[1]), m[3] ? `${m[2]} "${m[3]}"` : m[2]);
+  }
+  return out;
+}
+
+/** The `why` and `ref` of a tool call's arguments, even while they're still streaming. */
+function partialArgs(args: string): { why?: string; ref?: number } {
+  const why = /"why"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(args)?.[1]?.replace(/\\(.)/g, '$1');
+  const ref = /"ref"\s*:\s*(\d+)/.exec(args)?.[1];
+  return { why, ...(ref && { ref: Number(ref) }) };
+}
 
 const SYSTEM_PROMPT = `You are a fast browser-automation agent controlling the user's real Chrome tab.
 
@@ -22,6 +42,7 @@ Each turn you get a snapshot of the page: interactive elements as \`[ref] kind "
 Be fast:
 - Call several tools in one turn whenever you can predict the outcome, e.g. fill every form field and then submit. They run in order. If the page navigates or an action fails, the rest are skipped and you get a fresh snapshot.
 - Use read_text to read content. Only take a screenshot when the snapshot can't tell you what you need (visual layout, images, canvas).
+- Give each action a \`why\` of a few words, so the user can follow along.
 - Keep any text you write to one short line. Older snapshots are not kept, so write down facts you'll need later (prices, names, counts).
 
 Finish with done(result) as soon as the task is complete. Many pages show no confirmation, so once the actions the task asked for have run without an error, call done, in the same turn as the last action when you can (e.g. click, then done). Don't re-read the page looking for proof, and never repeat an action that already worked: a second click can undo a toggle, delete another row or place a second order. Check the page first only when the task asks for information or an action may have failed (a form that validates its fields, a warning that the point was covered).
@@ -77,6 +98,7 @@ export class Agent {
     this.t0 = performance.now();
     const tab = tabId === undefined ? await activeTab() : await chrome.tabs.get(tabId);
     const dbg = new TabDebugger(tab.id!);
+    dbg.showInput = this.settings.showInput;
     dbg.onDetached = () => this.abort.abort();
     await dbg.attach();
     const signal = this.abort.signal;
@@ -121,6 +143,13 @@ export class Agent {
 
       for (let step = 1; step <= this.settings.maxSteps; step++) {
         if (signal.aborted) throw new Error('Stopped');
+        if (this.settings.confine) {
+          const url = (await chrome.tabs.get(dbg.tabId)).url ?? '';
+          if (!this.settings.confine.some((o) => url.startsWith(o))) {
+            this.emit({ kind: 'error', text: `Stopped: this run may only use ${this.settings.confine.join(' and ')}, and the tab went to ${url}.` });
+            return;
+          }
+        }
 
         const t0 = performance.now();
         const snap = await snapshot(dbg.tabId);
@@ -136,6 +165,24 @@ export class Agent {
         const pageMsg = `Current page:\n${snap.text}${nudge}`;
         const turnAt = Math.round(performance.now() - this.t0);
         const shadow = jev?.ask(task, snap.text, signal);
+        const named = labels(snap.text);
+        const live: LiveStep = { step, status: `Looking at the page: ${snap.count} elements`, text: '', reasoning: '', calls: [] };
+        let liveTimer: ReturnType<typeof setTimeout> | undefined;
+        const sendLive = (now = false) => {
+          const send = () => { liveTimer = undefined; this.emit({ kind: 'live', text: live.status, live: structuredClone(live) }); };
+          if (now) { clearTimeout(liveTimer); send(); } else liveTimer ??= setTimeout(send, LIVE_MS);
+        };
+        const describeCall = (name: string, args: string) => {
+          const { why, ref } = partialArgs(args);
+          return { name, target: ref === undefined ? undefined : named.get(ref) ?? `[${ref}]`, why };
+        };
+        sendLive(true);
+        show(dbg, { op: 'decide', step, text: 'Thinking…' });
+        shadow?.then((j) => {
+          if (j.error) live.jev = { ms: j.ms, error: j.error };
+          else live.jev = { next: j.next, nextP: j.nextP, done: j.done, ms: j.ms, targetP: j.targetP, target: j.target === undefined ? undefined : named.get(j.target) ?? `[${j.target}]` };
+          sendLive(true);
+        });
         const messages: ChatMessage[] = [
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: `Task: ${task}${note ? `\n\n${note}` : ''}` },
@@ -152,14 +199,26 @@ export class Agent {
         let skipRest = false;
         const turn = new AbortController();
         const skipFromHere = () => { skipRest = true; turn.abort(); };
+        // Calls run in the order they were written, so the nth exec is the nth live call.
+        let ran = 0;
         const exec = async (call: ToolCall): Promise<Outcome> => {
-          if (skipRest || signal.aborted) return { call, result: { text: 'skipped: the page changed before this action; re-plan from the new snapshot' } };
+          const slot = live.calls[ran++];
+          const settleSlot = (state: LiveStep['calls'][number]['state']) => { if (slot) slot.state = state; sendLive(true); };
+          if (skipRest || signal.aborted) {
+            settleSlot('skipped');
+            return { call, result: { text: 'skipped: the page changed before this action; re-plan from the new snapshot' } };
+          }
           let args: any;
           try { args = JSON.parse(call.arguments || '{}'); } catch {
             skipFromHere();
             return { call, result: { text: `error: arguments were not valid JSON: ${call.arguments.slice(0, 200)}` } };
           }
           this.emit({ kind: 'action', text: `${call.name}(${call.arguments || ''})` });
+          if (slot) slot.state = 'running';
+          const d = describeCall(call.name, call.arguments);
+          live.status = `Doing: ${d.name}${d.target ? ` ${d.target}` : ''}`;
+          sendLive(true);
+          show(dbg, { op: 'decide', step, text: `${d.name}${d.target ? ` ${d.target}` : ''}`, why: d.why });
           const ta = performance.now();
           // Fingerprint the element before acting, while it's certainly still there.
           const recordable = RECORDABLE.has(call.name);
@@ -175,9 +234,10 @@ export class Agent {
           const failed = result.text.startsWith('error');
           this.emit({ kind: failed ? 'error' : 'result', text: result.text, ms: Math.round(performance.now() - ta) });
           jev?.record(call, result.text);
+          settleSlot(failed ? 'failed' : 'done');
           if (!failed && !LOOKS.has(call.name)) acted = true;
           if (recordable && !failed) {
-            const { ref: _ref, ...rest } = args;
+            const { ref: _ref, why: _why, ...rest } = args;
             steps.push(target ? { tool: call.name, args: rest, target } : { tool: call.name, args: rest });
           }
           if (result.stale || result.final) skipFromHere();
@@ -200,7 +260,20 @@ export class Agent {
           tools: TOOLS,
           signal,
           stop: turn.signal,
+          onDelta: (d) => {
+            if ('text' in d) live.text += d.text;
+            else if ('reasoning' in d) live.reasoning += d.reasoning;
+            else {
+              const prev = live.calls[d.call.index];
+              live.calls[d.call.index] = { ...describeCall(d.call.name, d.call.arguments), state: prev?.state === 'writing' || !prev ? 'writing' : prev.state };
+              if (!live.status.startsWith('Doing')) live.status = 'Deciding';
+            }
+            if (live.status.startsWith('Looking')) live.status = 'Thinking';
+            sendLive();
+          },
           onToolCall: (call) => {
+            const i = live.calls.findIndex((c) => c.state === 'writing');
+            if (i >= 0) live.calls[i].state = 'queued';
             const p = chain.then(() => exec(call));
             chain = p;
             outcomes.push(p);
@@ -223,6 +296,8 @@ export class Agent {
         if (reply.content.trim()) this.emit({ kind: 'thought', text: reply.content.trim() });
 
         const results = await Promise.all(outcomes);
+        live.status = finishedBy !== undefined ? 'Jev judged the task complete' : `Step ${step} finished`;
+        sendLive(true);
         const turnKey = [snap.text, ...reply.toolCalls.map((c) => `${c.name}${(c.arguments || '').replace(/\s+/g, '')}`)].join('\n');
         if (turns.has(turnKey)) stalled++;
         else turns.add(turnKey);
@@ -259,6 +334,7 @@ export class Agent {
       }
       this.emit({ kind: 'error', text: `Stopped after ${this.settings.maxSteps} steps without finishing.`, end: 'max-steps' });
     } finally {
+      if (dbg.showInput) this.emit({ kind: 'info', text: `input overlay: ${dbg.overlayStatus ?? 'never drawn (no mouse or key input this run)'}` });
       await dbg.detach();
     }
   }

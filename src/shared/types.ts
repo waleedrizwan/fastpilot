@@ -15,6 +15,12 @@ export interface Settings {
   jev: 'off' | 'shadow' | 'finish';
   /** OpenRouter's id for Jev. */
   jevModel: string;
+  /** Draw the pointer, clicks and keys on the page while a task runs. */
+  showInput: boolean;
+  /** Run tasks in FastPilot's own window instead of the tab you're looking at. */
+  ownWindow: boolean;
+  /** Origins the run must stay on; it stops if the tab leaves them. Set only for Gauntlet bridge runs, never saved. */
+  confine?: string[];
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -26,6 +32,8 @@ export const DEFAULT_SETTINGS: Settings = {
   replay: true,
   jev: 'off',
   jevModel: '~typesafe/jev-latest',
+  showInput: true,
+  ownWindow: true,
 };
 
 /** Jev is reached through OpenRouter, with the same key as the main model. */
@@ -52,7 +60,7 @@ export type PanelMsg = { type: 'run'; task: string } | { type: 'stop' } | { type
 
 /** Service worker → side panel. */
 export interface LogEvent {
-  kind: 'info' | 'thought' | 'action' | 'result' | 'error' | 'done' | 'snapshot' | 'idle';
+  kind: 'info' | 'thought' | 'action' | 'result' | 'error' | 'done' | 'snapshot' | 'idle' | 'live';
   text: string;
   ms?: number;
   /** ms since the task started. */
@@ -63,6 +71,22 @@ export interface LogEvent {
   end?: 'done' | 'handoff' | 'reply' | 'max-steps' | 'stalled';
   /** Jev's shadow answer for one turn, on its `info` event. */
   jev?: JevShadow;
+  /** The current step as it happens, on `live` events. Each one replaces the last. */
+  live?: LiveStep;
+}
+
+/** What the agent is doing in the current step, updated while the model is still writing. */
+export interface LiveStep {
+  step: number;
+  /** One line: looking at the page, thinking, or the action running. */
+  status: string;
+  /** The model's reply so far, and its reasoning when the provider streams it. */
+  text: string;
+  reasoning: string;
+  /** Actions written so far this step, each with the element it targets and why. */
+  calls: { name: string; target?: string; why?: string; state: 'writing' | 'queued' | 'running' | 'done' | 'failed' | 'skipped' }[];
+  /** Jev's pick for this step, once it answers. */
+  jev?: { next?: string; nextP?: number; target?: string; targetP?: number; done?: number; ms: number; error?: string };
 }
 
 /** What Jev, asked in shadow mode, would have done on one turn, beside what the model did. */

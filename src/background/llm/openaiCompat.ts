@@ -72,6 +72,8 @@ export class OpenAICompatProvider implements LLMProvider {
         signal: req.stop ? AbortSignal.any([req.signal, req.stop]) : req.signal,
       });
     } catch (e: any) {
+      // Stopped on purpose before the response started: nothing streamed, which is not an error.
+      if (req.stop?.aborted && !req.signal.aborted) return { content: '', toolCalls: [], firstTokenMs: -1, stopped: true };
       // Network failure before any response: nothing ran, so it's safe to retry.
       if (e?.name !== 'AbortError') e.retryable = true;
       throw e;
@@ -112,7 +114,7 @@ function usageOf(u: any): Usage | undefined {
 
 export async function parseStream(
   body: ReadableStream<Uint8Array>,
-  req: Pick<ChatRequest, 'onToolCall' | 'stop'> & { signal?: AbortSignal },
+  req: Pick<ChatRequest, 'onToolCall' | 'onDelta' | 'stop'> & { signal?: AbortSignal },
   t0 = performance.now(),
 ): Promise<ChatResponse> {
   const reader = body.getReader();
@@ -152,7 +154,12 @@ export async function parseStream(
         const delta = j.choices?.[0]?.delta;
         if (!delta) continue;
         if (firstTokenMs < 0) firstTokenMs = Math.round(performance.now() - t0);
-        if (delta.content) content += delta.content;
+        if (delta.content) {
+          content += delta.content;
+          req.onDelta?.({ text: delta.content });
+        }
+        // OpenRouter streams a model's reasoning separately, when it has any.
+        if (delta.reasoning) req.onDelta?.({ reasoning: delta.reasoning });
         for (const tc of delta.tool_calls ?? []) {
           const idx: number = tc.index ?? (tc.id ? calls.length : Math.max(0, calls.length - 1));
           if (!calls[idx]) {
@@ -163,6 +170,7 @@ export async function parseStream(
           if (tc.id) calls[idx].id = tc.id;
           if (tc.function?.name) calls[idx].name = tc.function.name;
           if (tc.function?.arguments) calls[idx].arguments += tc.function.arguments;
+          req.onDelta?.({ call: { index: idx, name: calls[idx].name, arguments: calls[idx].arguments } });
         }
       }
     }

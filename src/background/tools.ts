@@ -8,9 +8,11 @@ import { clearFocused, click, moveTo, pressKey, scrollBy, typeText } from './inp
 import { inPage, settle } from './page';
 import { locateRef, readText, refTag, setSelect, waitForText, type Located } from '../content/snapshot';
 
+/** Shown live in the side panel and on the page, so you can follow the agent's reasoning. Listed first so it's written first. */
+const why = { type: 'string', description: 'A few words on why this action, e.g. "submit the filled form"' };
 const fn = (name: string, description: string, properties: object = {}, required: string[] = []): ToolSpec => ({
   type: 'function',
-  function: { name, description, parameters: { type: 'object', properties, required } },
+  function: { name, description, parameters: { type: 'object', properties: name === 'done' || name === 'handoff' ? properties : { why, ...properties }, required } },
 });
 const ref = { type: 'integer', description: 'Element ref number from the snapshot' };
 

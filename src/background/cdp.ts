@@ -10,6 +10,10 @@ const STALE_MS = 3000;
 
 export class TabDebugger {
   mouse = { x: 0, y: 0 };
+  /** Draw the pointer, clicks and keys on the page (overlay.ts). */
+  showInput = true;
+  /** How the overlay's first update went: undefined until then, "ok", or the error. */
+  overlayStatus?: string;
   onDetached?: (reason: string) => void;
   private inflight = new Map<string, number>();
   private attached = false;
@@ -23,6 +27,9 @@ export class TabDebugger {
     chrome.debugger.onEvent.addListener(this.handleEvent);
     chrome.debugger.onDetach.addListener(this.handleDetach);
     await this.send('Network.enable');
+    // Chrome slows down pages whose window is covered or in the background, which can stall input and
+    // timers for seconds. Telling the page it has focus keeps it running as if you were looking at it.
+    await this.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
     const vp = await this.viewport();
     this.mouse = { x: vp.width / 2, y: vp.height / 2 };
   }

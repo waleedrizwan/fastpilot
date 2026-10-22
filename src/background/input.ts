@@ -3,6 +3,7 @@
 import type { Speed } from '../shared/types';
 import type { TabDebugger } from './cdp';
 import { keyDelay, mousePath, pressHold, sleep, wheelTicks, type Point } from './humanize';
+import { keyLabel, show } from './overlay';
 
 const MOD = { Alt: 1, Control: 2, Ctrl: 2, Meta: 4, Cmd: 4, Command: 4, Shift: 8 } as const;
 
@@ -37,6 +38,7 @@ export async function moveTo(dbg: TabDebugger, to: Point, speed: Speed): Promise
   for (const p of mousePath(dbg.mouse, to, speed)) {
     if (p.dt) await sleep(p.dt);
     await dbg.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y });
+    show(dbg, { op: 'move', x: p.x, y: p.y });
     dbg.mouse = { x: p.x, y: p.y };
   }
 }
@@ -44,10 +46,12 @@ export async function moveTo(dbg: TabDebugger, to: Point, speed: Speed): Promise
 export async function click(dbg: TabDebugger, at: Point, speed: Speed): Promise<void> {
   await moveTo(dbg, at, speed);
   const base = { x: at.x, y: at.y, button: 'left', clickCount: 1 };
+  show(dbg, { op: 'press', x: at.x, y: at.y });
   await dbg.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 });
   const hold = pressHold(speed);
   if (hold) await sleep(hold);
   await dbg.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 });
+  show(dbg, { op: 'release' });
 }
 
 async function sendKey(dbg: TabDebugger, def: KeyDef, modifiers = 0, commands?: string[]): Promise<void> {
@@ -77,20 +81,24 @@ export async function pressKey(dbg: TabDebugger, combo: string): Promise<void> {
   const def = KEYS[name] ?? (name.length === 1 ? charKey(name) : undefined);
   if (!def) throw new Error(`unknown key "${name}"`);
   const cmd = mods & (MOD.Control | MOD.Meta) ? COMMANDS[name.toLowerCase()] : undefined;
+  show(dbg, { op: 'key', label: keyLabel(combo) });
   await sendKey(dbg, def, mods, cmd ? [cmd] : undefined);
 }
 
 export async function clearFocused(dbg: TabDebugger): Promise<void> {
+  show(dbg, { op: 'key', label: keyLabel('Meta+a+Backspace') });
   await sendKey(dbg, charKey('a'), MOD.Meta, ['selectAll']);
   await sendKey(dbg, KEYS.Backspace);
 }
 
 export async function typeText(dbg: TabDebugger, text: string, speed: Speed): Promise<void> {
   if (speed === 'instant') {
+    show(dbg, { op: 'type', text });
     await dbg.send('Input.insertText', { text });
     return;
   }
   for (const ch of text) {
+    show(dbg, { op: 'type', text: ch });
     if (ch === '\n') await sendKey(dbg, KEYS.Enter);
     else await sendKey(dbg, charKey(ch));
     const d = keyDelay(speed, ch);
@@ -102,6 +110,7 @@ export async function scrollBy(dbg: TabDebugger, deltaY: number, speed: Speed): 
   const vp = await dbg.viewport();
   const { x, y } = dbg.mouse;
   if (x < 0 || y < 0 || x > vp.width || y > vp.height) await moveTo(dbg, { x: vp.width / 2, y: vp.height / 2 }, speed);
+  show(dbg, { op: 'scroll', dy: deltaY });
   for (const t of wheelTicks(deltaY, speed)) {
     await dbg.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: dbg.mouse.x, y: dbg.mouse.y, deltaX: 0, deltaY: t.dy });
     if (t.dt) await sleep(t.dt);

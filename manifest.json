@@ -7,6 +7,6 @@
   "background": { "service_worker": "src/background/index.ts", "type": "module" },
   "side_panel": { "default_path": "src/sidepanel/index.html" },
   "action": { "default_title": "Open FastPilot" },
-  "permissions": ["sidePanel", "debugger", "tabs", "scripting", "storage"],
+  "permissions": ["sidePanel", "debugger", "tabs", "scripting", "storage", "alarms", "system.display"],
   "host_permissions": ["<all_urls>"]
 }

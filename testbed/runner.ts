@@ -1,33 +1,29 @@
 // Gauntlet runner: drives the FastPilot extension through the challenges and
-// collects the scores. It attaches to your own running Chrome, where FastPilot
-// is loaded from dist/, opens each challenge as a tab you can watch, hands the task to the extension's test hook (fastpilotTest in
-// src/background/index.ts), and reads the result back from /api/results.
+// collects the scores. It runs in your own Chrome without Chrome's debugging port:
+// each challenge is queued on the Gauntlet server, FastPilot (loaded unpacked from
+// dist/) picks it up, runs it in a tab you can watch, and posts its log back
+// (src/shared/bridge.ts). Results are read back from /api/results.
 //
 //   FASTPILOT_API_KEY=... npm run gauntlet -- --only supported --area lab:clicks
 //   npm run gauntlet -- --help
 //
-// The API key is passed to the extension in memory over the DevTools pipe. It is
-// never stored in the Chrome profile, the report or the console output.
+// The API key, when given here, reaches FastPilot through the local Gauntlet server
+// in memory only. It is never stored, written to the report or printed.
 
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, styleText } from 'node:util';
+import { BRIDGE_BASE, BRIDGE_HEADER, type BridgeHello, type BridgeJob } from '../src/shared/bridge.ts';
 import { DEFAULT_SETTINGS, needsApiKey, type LogEvent, type Settings } from '../src/shared/types.ts';
 import type { Attempt, Result, Status } from './lib/results.ts';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DIST = join(ROOT, 'dist');
-const LOAD_MS = 10_000;
 /** How long to wait after the agent stops for the page or server to report. */
 const REPORT_GRACE_MS = 1500;
 const REPORT_MAX_MS = 5000;
-/** Marks the browser as an agent run for the site. */
-const AGENT_COOKIE = 'gauntlet_agent';
-
 const HELP = `Runs FastPilot through Gauntlet challenges and prints a summary.
 
 Usage: npm run gauntlet -- [options]
@@ -54,13 +50,12 @@ Running:
   --verbose, -v     Print the agent's log as it runs.
 
 Browser and site:
-  By default the runner uses your own Chrome, the one you browse with. Load dist/ there once with
-  "Load unpacked" on chrome://extensions, and turn on "Allow remote debugging for this browser
-  instance" on chrome://inspect/#remote-debugging. Chrome asks you to Allow each run. FastPilot is
-  reloaded from dist/ first, challenges open as tabs in your window, and only those tabs are closed.
-  --base <url>      Gauntlet URL (default http://localhost:5175). Started in-process if it isn't running.
-  --cdp <url>       Attach to another running Chrome (http://127.0.0.1:9222 or a ws:// URL) that
-                    already has dist/ loaded.
+  Runs in your own Chrome, the one you browse with, with no prompts and no debugging port. Load
+  dist/ there once with "Load unpacked" on chrome://extensions; that development build checks the
+  Gauntlet server for work every 30 s, runs each challenge in a tab you can watch, and closes only the
+  tabs it opened. Each run first reloads FastPilot so it runs the current build.
+  --base <url>      Gauntlet URL (default http://localhost:5175, the only address FastPilot polls).
+                    Started in-process if it isn't running.
   --build, --no-build
                     Always or never run "npm run build" first. By default it builds when dist/ is
                     missing or older than src/.
@@ -71,8 +66,7 @@ Model (environment variables):
                       CEREBRAS_API_KEY to match the base URL.
   FASTPILOT_MODEL     Model id (default ${DEFAULT_SETTINGS.model} on the default base URL).
   FASTPILOT_BASE_URL  OpenAI-compatible base URL (default ${DEFAULT_SETTINGS.baseUrl}).
-  In your own Chrome (or with --cdp), anything not set here comes from the extension's saved
-  settings. The provider's key variable is used only when no key is saved there.
+  Anything not set here comes from FastPilot's saved settings in your Chrome. The provider's key variable is used only when no key is saved there.
 `;
 
 // ---------------------------------------------------------------------------
@@ -97,7 +91,6 @@ const { values: opt } = parseArgs({
     reset: { type: 'boolean' },
     verbose: { type: 'boolean', short: 'v' },
     base: { type: 'string' },
-    cdp: { type: 'string' },
     build: { type: 'boolean' },
     out: { type: 'string' },
     help: { type: 'boolean', short: 'h' },
@@ -146,256 +139,54 @@ function select(all: ApiChallenge[]): ApiChallenge[] {
 }
 
 // ---------------------------------------------------------------------------
-// A minimal DevTools protocol client, over Chrome's pipe or a WebSocket
+// The bridge to FastPilot (src/shared/bridge.ts): jobs go through the Gauntlet server, never through
+// Chrome's debugging port, so Chrome never asks to allow a connection.
 
-type Listener = (method: string, params: any, sessionId?: string) => void;
+/** FastPilot looks for work at least every 30 s while it's asleep. */
+const WAKE_MS = 45_000;
+const OTHER_ORIGIN = `http://127.0.0.1:${process.env.OTHER_PORT || 5176}`;
 
-class Cdp {
-  private seq = 0;
-  private calls = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; method: string; sessionId?: string }>();
-  private listeners = new Set<Listener>();
-  private closed: string | null = null;
-  private write: (msg: string) => void;
+type NewJob = { [K in BridgeJob['kind']]: Omit<Extract<BridgeJob, { kind: K }>, 'id'> }[BridgeJob['kind']];
 
-  constructor(write: (msg: string) => void) {
-    this.write = write;
-  }
-
-  receive(raw: string) {
-    const m = JSON.parse(raw);
-    if (m.id !== undefined) {
-      const call = this.calls.get(m.id);
-      this.calls.delete(m.id);
-      if (m.error) call?.reject(new Error(`${call.method}: ${m.error.message}`));
-      else call?.resolve(m.result);
-    } else {
-      // Calls into a session that went away would otherwise never settle.
-      if (m.method === 'Target.detachedFromTarget') {
-        for (const [id, c] of this.calls) {
-          if (c.sessionId === m.params.sessionId) {
-            this.calls.delete(id);
-            c.reject(new Error(`${c.method}: the target went away`));
-          }
-        }
-      }
-      for (const l of this.listeners) l(m.method, m.params, m.sessionId);
-    }
-  }
-
-  send<T = any>(method: string, params: object = {}, sessionId?: string): Promise<T> {
-    if (this.closed) return Promise.reject(new Error(this.closed));
-    const id = ++this.seq;
-    return new Promise<T>((resolve, reject) => {
-      this.calls.set(id, { resolve, reject, method, sessionId });
-      this.write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
-    });
-  }
-
-  on(l: Listener) {
-    this.listeners.add(l);
-  }
-
-  close(reason: string) {
-    this.closed = reason;
-    for (const c of this.calls.values()) c.reject(new Error(reason));
-    this.calls.clear();
-  }
+async function bridge<T = any>(base: string, path: string, body: object): Promise<T> {
+  const res = await fetch(base + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', [BRIDGE_HEADER]: '1' }, body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${path} returned ${res.status}`);
+  return res.json() as Promise<T>;
 }
 
-interface Browser { cdp: Cdp; version: string; extensionId: string; close(): Promise<void> }
+/** Waits for a copy of FastPilot that started after `since` (ms since epoch) to check in, and returns what it reported. */
+async function waitForFastPilot(base: string, message: string, since = -1): Promise<BridgeHello> {
+  const status = async () => {
+    const s = await bridge<{ connected: boolean; seenAt: number; hello: BridgeHello | null }>(base, '/api/bridge/status', {});
+    return s.connected && s.hello && (s.hello.started ?? 0) > since ? s.hello : undefined;
+  };
+  let hello = await status();
+  if (hello) return hello;
+  if (message) console.log(message);
+  hello = await poll(status, WAKE_MS);
+  return hello ?? fail(`FastPilot didn't check in. In your Chrome, load ${DIST} with "Load unpacked" on chrome://extensions (once), then run this again.`);
+}
 
-/** The profile folder of the Chrome you browse with. */
-function chromeUserDataDir(): string {
-  if (process.platform === 'darwin') return join(homedir(), 'Library/Application Support/Google/Chrome');
-  if (process.platform === 'win32') return join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData/Local'), 'Google/Chrome/User Data');
-  return join(homedir(), '.config/google-chrome');
+async function enqueue(base: string, job: NewJob): Promise<string> {
+  return (await bridge<{ id: string }>(base, '/api/bridge/enqueue', { job })).id;
 }
 
 /**
- * The DevTools address of the Chrome you browse with. Chrome writes it to DevToolsActivePort once
- * "Allow remote debugging for this browser instance" is on, and recent versions don't serve
- * /json/version for the default profile, so the file is the only way to find it.
+ * Follows a job's log until it finishes, passing each new event on. Resolves false if `ms` runs out
+ * first. `seen` carries how many events were already passed on, so following again doesn't repeat them.
  */
-function ownChrome(): string {
-  const file = join(chromeUserDataDir(), 'DevToolsActivePort');
-  if (!existsSync(file)) {
-    fail('Your Chrome isn\'t accepting connections. Open chrome://inspect/#remote-debugging in Chrome, turn on '
-      + '"Allow remote debugging for this browser instance", then run this again.');
-  }
-  const [port, path] = readFileSync(file, 'utf8').split('\n').map((l) => l.trim());
-  return `ws://127.0.0.1:${port}${path}`;
-}
-
-/** Attaches to a running Chrome: your own, or one started with --remote-debugging-port. */
-async function attach(url: string): Promise<Browser> {
-  let ws = url;
-  if (/^https?:/.test(url)) {
-    const info = await fetch(new URL('/json/version', url)).then((r) => r.json()).catch(() => fail(`No Chrome DevTools endpoint at ${url}.`));
-    ws = info.webSocketDebuggerUrl;
-  }
-  const sock = new WebSocket(ws);
-  // Your own Chrome holds the connection until you answer its prompt.
-  const hint = setTimeout(() => console.log('Chrome is asking "Allow remote debugging?". Click Allow to continue.'), 1500);
-  await new Promise((resolve, reject) => {
-    sock.onopen = resolve;
-    sock.onerror = () => reject(new Error(`Couldn't connect to Chrome at ${ws}. Check that it's open and that you clicked Allow.`));
-  }).finally(() => clearTimeout(hint));
-  const cdp = new Cdp((m) => sock.send(m));
-  sock.onmessage = (e) => cdp.receive(String(e.data));
-  sock.onclose = () => cdp.close('Chrome closed the DevTools connection');
-  const { product } = await cdp.send('Browser.getVersion');
-  return { cdp, version: product, extensionId: unpackedId(DIST), close: async () => sock.close() };
-}
-
-/** Chrome derives an unpacked extension's id from its absolute path. */
-function unpackedId(path: string): string {
-  const hex = createHash('sha256').update(realpathSync(path)).digest('hex').slice(0, 32);
-  return [...hex].map((c) => String.fromCharCode(97 + parseInt(c, 16))).join('');
-}
-
-// ---------------------------------------------------------------------------
-// The extension's service worker
-
-const BINDING = '__gauntletEmit';
-
-class Extension {
-  /** Receives the agent's log events for the task in progress. */
-  onEvent: (e: LogEvent) => void = () => {};
-  alive = true;
-
-  private cdp: Cdp;
-  private targetId: string;
-  private sessionId: string;
-
-  private constructor(cdp: Cdp, targetId: string, sessionId: string) {
-    this.cdp = cdp;
-    this.targetId = targetId;
-    this.sessionId = sessionId;
-  }
-
-  static async attach(b: Browser): Promise<Extension> {
-    const { cdp } = b;
-    const workers = async () => (await cdp.send('Target.getTargets')).targetInfos
-      .filter((t: any) => t.type === 'service_worker' && t.url.startsWith('chrome-extension://'));
-    const ours = async () => (await workers()).find((t: any) => t.url.startsWith(`chrome-extension://${b.extensionId}/`));
-    let target = await poll(ours, 3000);
-    if (!target) {
-      // Loaded from another folder: look for any running worker that is FastPilot's.
-      for (const t of await workers()) {
-        const w = await Extension.connect(cdp, t.targetId);
-        if (await w.call(function () { return chrome.runtime.getManifest().name; }) === 'FastPilot') return w.ready();
-        await cdp.send('Target.detachFromTarget', { sessionId: w.sessionId }).catch(() => {});
-      }
-    }
-    if (!target) {
-      // Not running in this Chrome: load dist/ the way "Load unpacked" would (a no-op reload if it's only asleep).
-      const loaded = await cdp.send('Extensions.loadUnpacked', { path: DIST }).then(() => true, () => false);
-      if (loaded) target = await poll(ours, 5000);
-    }
-    if (!target) {
-      // Asleep (idle, or just reloaded): opening one of its pages wakes it.
-      const { targetId } = await cdp.send('Target.createTarget', { url: `chrome-extension://${b.extensionId}/src/sidepanel/index.html`, background: true });
-      target = await poll(ours, 5000);
-      await cdp.send('Target.closeTarget', { targetId }).catch(() => {});
-    }
-    if (!target) {
-      throw new Error(`FastPilot isn't loaded in that Chrome. Load ${DIST} with "Load unpacked" on chrome://extensions, then try again.`);
-    }
-    return (await Extension.connect(cdp, target.targetId)).ready();
-  }
-
-  private static async connect(cdp: Cdp, targetId: string): Promise<Extension> {
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-    const w = new Extension(cdp, targetId, sessionId);
-    cdp.on((method, params, sid) => {
-      if (method === 'Runtime.bindingCalled' && sid === sessionId && params.name === BINDING) w.onEvent(JSON.parse(params.payload));
-      if (method === 'Target.detachedFromTarget' && params.sessionId === sessionId) w.alive = false;
-    });
-    return w;
-  }
-
-  private async ready(): Promise<Extension> {
-    await this.cdp.send('Runtime.enable', {}, this.sessionId);
-    await this.cdp.send('Runtime.addBinding', { name: BINDING }, this.sessionId);
-    // The worker's target shows up before its modules have finished loading.
-    const hooked = await poll(() => this.call(function (this: any) { return typeof this.fastpilotTest?.run === 'function'; }), 5000);
-    if (!hooked) throw new Error('This FastPilot build has no test hook. Run `npm run build` and reload the extension.');
-    return this;
-  }
-
-  /** Stops the worker, which ends any task stuck in it, and attaches to a fresh one. */
-  async restart(b: Browser): Promise<Extension> {
-    // The worker comes back under the same target, so detach first or this session would get its events too.
-    this.onEvent = () => {};
-    await this.cdp.send('Target.detachFromTarget', { sessionId: this.sessionId }).catch(() => {});
-    this.alive = false;
-    await this.cdp.send('Target.closeTarget', { targetId: this.targetId }).catch(() => {});
-    await poll(async () => {
-      const { targetInfos } = await this.cdp.send('Target.getTargets');
-      return !targetInfos.some((t: any) => t.targetId === this.targetId) || undefined;
-    }, 5000);
-    return Extension.attach(b);
-  }
-
-  /** Reloads the extension from its folder, so a Chrome that loaded dist/ before the last build runs the current code. */
-  async reload(b: Browser): Promise<Extension> {
-    this.onEvent = () => {};
-    // Deferred so the call returns before the worker goes away.
-    await this.call(function () { setTimeout(() => chrome.runtime.reload(), 50); });
-    await poll(async () => !this.alive || undefined, 5000);
-    return Extension.attach(b);
-  }
-
-  /** Calls a self-contained function in the worker, with `this` bound to its global object. */
-  async call<T = any>(fn: (this: any, ...args: any[]) => any, ...args: unknown[]): Promise<T> {
-    const { result: global } = await this.cdp.send('Runtime.evaluate', { expression: 'globalThis' }, this.sessionId);
-    const r = await this.cdp.send('Runtime.callFunctionOn', {
-      objectId: global.objectId, functionDeclaration: fn.toString(), arguments: args.map((value) => ({ value })),
-      awaitPromise: true, returnByValue: true,
-    }, this.sessionId);
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description?.split('\n')[0] ?? r.exceptionDetails.text);
-    return r.result.value as T;
-  }
-}
-
-// These run inside the service worker, so each must be self-contained.
-
-/** Opens a tab (or navigates one) and waits for it to load. */
-async function swOpen(tabId: number | null, url: string, maxMs: number) {
-  const tab = tabId === null ? await chrome.tabs.create({ url, active: true }) : await chrome.tabs.update(tabId, { url, active: true });
-  const id = tab!.id!;
-  const end = Date.now() + maxMs;
+async function follow(base: string, id: string, ms: number, onEvent: (e: LogEvent) => void = () => {}, seen = { n: 0 }): Promise<boolean> {
+  const end = Date.now() + ms;
   for (;;) {
-    await new Promise((r) => setTimeout(r, 50));
-    const t = await chrome.tabs.get(id);
-    if ((t.status === 'complete' && !t.pendingUrl && t.url && t.url !== 'about:blank') || Date.now() > end) return { tabId: id, url: t.url ?? '' };
+    const r = await bridge<{ events: LogEvent[]; done: boolean }>(base, '/api/bridge/events', { job: id, after: seen.n });
+    seen.n += r.events.length;
+    r.events.forEach(onEvent);
+    if (r.done) return true;
+    if (Date.now() > end) return false;
+    await sleep(150);
   }
-}
-
-async function swTabIds() {
-  return (await chrome.tabs.query({})).map((t) => t.id!);
-}
-
-/** Closes tabs opened since `before`: all of them, or only those on the given origins. */
-async function swCloseTabs(before: number[], tabId: number, origins: string[] | null) {
-  const extra = (await chrome.tabs.query({})).filter((t) => !before.includes(t.id!) && (t.id === tabId || !origins
-    || !t.url || t.url === 'about:blank' || origins.some((o) => t.url!.startsWith(o))));
-  if (extra.length) await chrome.tabs.remove(extra.map((t) => t.id!));
-}
-
-/** The settings a run will use, without the key. */
-async function swSettings(defaults: Settings, override: Partial<Settings>) {
-  const stored = (await chrome.storage.local.get('settings')).settings as Partial<Settings> | undefined;
-  const s = { ...defaults, ...stored, ...override };
-  return { baseUrl: s.baseUrl, model: s.model, speed: s.speed, maxSteps: s.maxSteps, replay: s.replay, jev: s.jev, jevModel: s.jevModel, hasKey: !!s.apiKey };
-}
-
-function swRun(this: any, task: string, tabId: number, settings: Partial<Settings>) {
-  return this.fastpilotTest.run(task, (e: unknown) => this.__gauntletEmit(JSON.stringify(e)), { tabId, settings });
-}
-
-function swStop(this: any) {
-  this.fastpilotTest.stop();
 }
 
 // ---------------------------------------------------------------------------
@@ -457,57 +248,50 @@ function outcomeOf(c: ApiChallenge, server: Status, finish: Finish): Outcome {
   return finish === 'timeout' || finish === 'error' ? finish : 'fail';
 }
 
-interface Ctx { b: Browser; w: Extension; base: string; settings: Partial<Settings>; redact: (s: string) => string }
+interface Ctx { base: string; settings: Partial<Settings>; redact: (s: string) => string; job?: string }
 
 async function runOne(ctx: Ctx, c: ApiChallenge, onLog: (e: LogEvent) => void): Promise<RunResult> {
-  const { b, base } = ctx;
-  if (!opt['keep-state']) {
-    await api(base, '/api/reset-site', {});
-    // A person running the catalog would have answered the cookie banner once; without this it covers
-    // every store page and each answer counts as an attempt at site/cookie-consent.
-    await b.cdp.send('Storage.setCookies', {
-      cookies: [{ name: 'consent', value: 'necessary', url: `${base}/`, sameSite: 'Lax', expires: Date.now() / 1000 + 86400 * 365 }],
-    });
-  }
-  // Hides the challenge strip's pass/fail status, result line and expected outcome (see page() in
-  // lib/layout.ts). Otherwise the agent can read "✓ Challenge passed" off the page and stop there.
-  await b.cdp.send('Storage.setCookies', { cookies: [{ name: AGENT_COOKIE, value: '1', url: `${base}/`, sameSite: 'Lax' }] });
+  const { base } = ctx;
+  if (!opt['keep-state']) await api(base, '/api/reset-site', {});
   if (opt.reset) await api(base, '/api/results/reset', { id: c.id });
   const seen = (await challengesFrom(base)).find((x) => x.id === c.id)!.result.attempts.length;
 
-  const before = await ctx.w.call<number[]>(swTabIds);
-  const start = `${base}/challenges/start/${c.id}`;
+  // The start page sets two cookies for agent runs. agent=1 hides the challenge strip's pass/fail status,
+  // result line and expected outcome (see page() in lib/layout.ts); otherwise the agent can read
+  // "✓ Challenge passed" off the page and stop there. consent answers the cookie banner the way a person
+  // would have once; without it the banner covers every store page and each answer counts as an attempt.
+  const start = `${base}/challenges/start/${c.id}?agent=1${opt['keep-state'] ? '' : '&consent=necessary'}`;
   // Tasks that say "Sign in as demo first" expect the person running them to have done it.
   const signedIn = /sign in as demo/i.test(c.task);
-  let { tabId } = await ctx.w.call(swOpen, null, signedIn ? `${base}/challenges/demo-signin` : start, LOAD_MS);
-  if (signedIn) await ctx.w.call(swOpen, tabId, start, LOAD_MS);
 
   const log: LogEvent[] = [];
-  ctx.w.onEvent = (e) => {
+  const onEvent = (e: LogEvent) => {
     if (e.kind === 'idle') return;
     const ev = { ...e, text: ctx.redact(e.text).slice(0, 2000) };
     log.push(ev);
     onLog(ev);
   };
   const t0 = performance.now();
-  let restarted = false;
-  const run = ctx.w.call(swRun, c.task, tabId, ctx.settings).then(() => {}, (e: Error) => {
-    if (!restarted) log.push({ kind: 'error', text: ctx.redact(`runner: ${e.message}`) });
+  const id = await enqueue(base, {
+    kind: 'run', task: c.task, settings: ctx.settings, confine: [base, OTHER_ORIGIN],
+    urls: signedIn ? [`${base}/challenges/demo-signin`, start] : [start],
   });
-  const timedOut = await Promise.race([run.then(() => false), sleep(Number(opt.timeout) * 1000).then(() => true)]);
+  ctx.job = id;
+  const logSeen = { n: 0 };
+  const timedOut = !(await follow(base, id, Number(opt.timeout) * 1000, onEvent, logSeen));
   const ms = Math.round(performance.now() - t0);
   if (timedOut) {
-    await ctx.w.call(swStop).catch(() => {});
-    const stopped = await Promise.race([run.then(() => true), sleep(10_000).then(() => false)]);
-    // A tool that ignores Stop keeps the task, and so every later one, busy. Restarting the worker ends it.
-    if (!stopped) {
-      restarted = true;
-      ctx.w = await ctx.w.restart(b);
+    await bridge(base, '/api/bridge/stop', { job: id });
+    // A tool that ignores Stop keeps FastPilot, and so every later challenge, busy. Reloading it ends the task.
+    if (!(await follow(base, id, 10_000, onEvent, logSeen))) {
+      const at = Date.now();
+      await enqueue(base, { kind: 'reload' });
+      await waitForFastPilot(base, 'Reloading FastPilot to end a task that ignored Stop…', at);
     }
   }
-  ctx.w.onEvent = () => {};
+  ctx.job = undefined;
 
-  // Page scripts report a moment after the last action; give them time.
+  // Page scripts report a moment after the last action; give them time before closing the tab.
   let attempts: Attempt[] = [];
   const until = Date.now() + REPORT_MAX_MS;
   await sleep(REPORT_GRACE_MS);
@@ -516,7 +300,7 @@ async function runOne(ctx: Ctx, c: ApiChallenge, onLog: (e: LogEvent) => void): 
     if (attempts.length || Date.now() > until) break;
     await sleep(300);
   }
-  await ctx.w.call(swCloseTabs, before, tabId, [base, 'http://127.0.0.1:']).catch(() => {});
+  await follow(base, await enqueue(base, { kind: 'close', run: id }), 10_000);
 
   const { finish, text } = finishOf(log, timedOut);
   let server = statusOf(attempts);
@@ -703,42 +487,51 @@ async function mainWithSite(base: string) {
   const redact = (s: string) => (settings.apiKey ? s.split(settings.apiKey).join('[key]') : s);
   buildIfNeeded();
 
-  const b = await attach(opt.cdp ?? ownChrome());
+  if (new URL(base).origin !== BRIDGE_BASE) fail(`FastPilot looks for work only at ${BRIDGE_BASE}, so --base must be that address.`);
+  let hello = await waitForFastPilot(base, 'Waiting for FastPilot in your Chrome to check in (it looks for work every 30 s)…');
+  // Your Chrome may have loaded dist/ before the last build; reload it so it runs the current code.
+  const reloadAt = Date.now();
+  await enqueue(base, { kind: 'reload' });
+  hello = await waitForFastPilot(base, '', reloadAt);
+  // The reload should have picked up dist/. If Chrome still reports an older build, say so.
+  const built = statSync(join(DIST, 'manifest.json')).mtimeMs;
+  if (!hello.build || Date.parse(hello.build) < built - 60_000) {
+    console.log(styleText('yellow', `FastPilot in Chrome is build ${hello.build ?? '(unknown, older)'}, older than dist/. Reload it once on chrome://extensions.`));
+  }
   let ctx: Ctx | undefined;
   let stopping = false;
   const onSigint = () => {
     if (stopping) process.exit(130);
     stopping = true;
     console.log(styleText('yellow', '\nStopping after this challenge (Ctrl-C again to quit now)…'));
-    ctx?.w.call(swStop).catch(() => {});
+    if (ctx?.job) bridge(base, '/api/bridge/stop', { job: ctx.job }).catch(() => {});
   };
   process.on('SIGINT', onSigint);
 
   const results: RunResult[] = [];
   const startedAt = new Date();
-  let effective: Awaited<ReturnType<typeof swSettings>> | undefined;
+  // What this run uses: FastPilot's saved settings, with anything given here on top.
+  const { apiKey: _key, ...overrides } = settings;
+  let effective = { ...hello.settings, ...overrides, hasKey: hello.hasKey || !!settings.apiKey };
   try {
-    ctx = { b, w: await Extension.attach(b), base, settings, redact };
-    ctx.w = await ctx.w.reload(b);
-    effective = await ctx.w.call<Awaited<ReturnType<typeof swSettings>>>(swSettings, DEFAULT_SETTINGS, settings);
-    // No key saved in the extension: fall back to the provider's own variable.
-    const keyVar = !effective.hasKey && KEY_ENV.find(([re]) => re.test(effective!.baseUrl))?.[1];
+    ctx = { base, settings, redact };
+    // No key saved in FastPilot: fall back to the provider's own variable.
+    const keyVar = !effective.hasKey && KEY_ENV.find(([re]) => re.test(effective.baseUrl))?.[1];
     if (keyVar && process.env[keyVar]) {
       settings.apiKey = process.env[keyVar];
-      effective = await ctx.w.call<Awaited<ReturnType<typeof swSettings>>>(swSettings, DEFAULT_SETTINGS, settings);
+      effective = { ...effective, hasKey: true };
     }
     if (!effective.model) throw new Error('No model set. Set FASTPILOT_MODEL.');
     if (!effective.hasKey && needsApiKey(effective.baseUrl)) {
       throw new Error('No API key. Set FASTPILOT_API_KEY (or the provider\'s own key variable, see --help).');
     }
-    console.log(`${b.version} · FastPilot ${b.extensionId}${opt.cdp ? ' · attached' : ' · your Chrome'}`);
+    console.log(`FastPilot ${hello.version} (build ${hello.build}) · your Chrome, through the Gauntlet bridge`);
     console.log(`Model ${effective.model} via ${effective.baseUrl} · speed ${effective.speed} · up to ${effective.maxSteps} steps · ${opt.timeout}s timeout${effective.jev !== 'off' ? ` · Jev ${effective.jev} (${effective.jevModel})` : ''}`);
     console.log(`Running ${picked.length} challenge${picked.length === 1 ? '' : 's'} against ${base}\n`);
 
     const pad = String(picked.length).length;
     for (const [i, c] of picked.entries()) {
       if (stopping) break;
-      if (!ctx.w.alive) ctx.w = await Extension.attach(b);
       const tag = `[${String(i + 1).padStart(pad)}/${picked.length}]`;
       if (opt.verbose) console.log(`${tag} ${c.id}  ${styleText('dim', clip(c.task, 100))}`);
       const r = await runOne(ctx, c, opt.verbose ? printEvent : () => {});
@@ -760,9 +553,8 @@ async function mainWithSite(base: string) {
     }
   } finally {
     process.off('SIGINT', onSigint);
-    // This is someone's own browser: show them the challenge status again.
-    await b.cdp.send('Storage.setCookies', { cookies: [{ name: AGENT_COOKIE, value: '', url: `${base}/`, expires: 1 }] }).catch(() => {});
-    await b.close();
+    // This is your own browser: show the challenge status again.
+    await enqueue(base, { kind: 'visit', url: `${base}/challenges/agent-off` }).then((id) => follow(base, id, 15_000)).catch(() => {});
   }
 
   if (!results.length) return;
@@ -770,9 +562,9 @@ async function mainWithSite(base: string) {
   printSummary(summary, results);
   const out = opt.out ?? join(ROOT, 'testbed/.data/runs', `${startedAt.toISOString().replace(/[:.]/g, '-')}.json`);
   mkdirSync(dirname(out), { recursive: true });
-  const { hasKey: _k, ...model } = effective!;
+  const { hasKey: _k, ...model } = effective;
   writeFileSync(out, `${JSON.stringify({
-    startedAt: startedAt.toISOString(), finishedAt: new Date().toISOString(), base, chrome: b.version, extensionId: b.extensionId,
+    startedAt: startedAt.toISOString(), finishedAt: new Date().toISOString(), base, fastpilot: hello.version,
     settings: model, timeoutSec: Number(opt.timeout), filters: { area: list(opt.area), only: opt.only, check: list(opt.check), id: list(opt.id), level: list(opt.level), limit: opt.limit },
     summary, results,
   }, null, 1)}\n`);

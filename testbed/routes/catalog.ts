@@ -54,6 +54,11 @@ get('/challenges/start/*', (req) => {
   const c = challenge(req.params.rest);
   if (!c) return redirect(req, '/challenges');
   setCookie(req, 'gch', `${c.id}|${Date.now()}`);
+  // Set by the runner for agent runs: hide the challenge status from the agent, and answer the cookie
+  // banner the way a person would have once (see testbed/runner.ts).
+  if (req.query.get('agent') === '1') setCookie(req, 'gauntlet_agent', '1');
+  const consent = req.query.get('consent');
+  if (consent) setCookie(req, 'consent', consent, 'Path=/; Max-Age=31536000; SameSite=Lax');
   const passed: string[] | undefined = req.session.data.passed;
   if (passed) req.session.data.passed = passed.filter((x) => x !== c.id);
   c.onStart?.(req);

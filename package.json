@@ -10,7 +10,8 @@
     "fixture": "vite test/fixtures --port 5174",
     "testbed": "node testbed/server.ts",
     "gauntlet": "node testbed/runner.ts",
-    "test": "node --test test/*.test.ts"
+    "test": "node --test test/*.test.ts",
+    "chrome-launcher": "osacompile -o \"$HOME/Applications/Chrome for FastPilot.app\" scripts/chrome-launcher.applescript"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.7.1",
