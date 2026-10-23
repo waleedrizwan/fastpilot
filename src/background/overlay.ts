@@ -127,15 +127,43 @@ function overlay(call: Call) {
 const SOURCE = overlay.toString();
 const KEY_NAMES: Record<string, string> = { Meta: '⌘', Cmd: '⌘', Command: '⌘', Control: '⌃', Ctrl: '⌃', Alt: '⌥', Shift: '⇧', Enter: '↵ Enter', Backspace: '⌫', Delete: '⌦', Escape: 'Esc', Tab: '⇥ Tab', ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→', Space: 'Space' };
 
-/** Updates the overlay without waiting. A page that's navigating just misses the update. */
+type Evaluated = { result?: { value?: unknown }; exceptionDetails?: { exception?: { description?: string }; text?: string } };
+
+/** Pointer moves waiting to be drawn, per tab: only the latest one matters, so moves never pile up. */
+const moves = new WeakMap<TabDebugger, { busy: boolean; next?: Call }>();
+
+/**
+ * Updates the overlay without waiting. A page that's navigating just misses the update. The overlay's
+ * source goes to each page once; later calls only send the call itself.
+ */
 export function show(dbg: TabDebugger, call: Call): void {
   if (!dbg.showInput) return;
-  dbg.send<{ exceptionDetails?: { exception?: { description?: string }; text?: string } }>('Runtime.evaluate', { expression: `(${SOURCE})(${JSON.stringify(call)})`, returnByValue: true })
-    .then((r) => {
-      const err = r.exceptionDetails && (r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? 'error');
-      if (err) dbg.overlayStatus = String(err).split('\n')[0];
-      else dbg.overlayStatus ??= 'ok';
-    }, (e) => { dbg.overlayStatus ??= `not sent: ${e?.message ?? e}`; });
+  if (call.op !== 'move') return void draw(dbg, call);
+  let m = moves.get(dbg);
+  if (!m) moves.set(dbg, (m = { busy: false }));
+  if (m.busy) { m.next = call; return; }
+  m.busy = true;
+  const pump = (c: Call): Promise<void> => draw(dbg, c).then(() => {
+    const next = m.next;
+    m.next = undefined;
+    if (next) return pump(next);
+    m.busy = false;
+  });
+  void pump(call);
+}
+
+async function draw(dbg: TabDebugger, call: Call): Promise<void> {
+  const args = JSON.stringify(call);
+  const evaluate = (expression: string) => dbg.send<Evaluated>('Runtime.evaluate', { expression, returnByValue: true });
+  try {
+    let r = await evaluate(`typeof __fpOverlayShow === 'function' ? (__fpOverlayShow(${args}), 1) : 0`);
+    if (!r.exceptionDetails && r.result?.value === 0) r = await evaluate(`(window.__fpOverlayShow = ${SOURCE})(${args})`);
+    const err = r.exceptionDetails && (r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? 'error');
+    if (err) dbg.overlayStatus = String(err).split('\n')[0];
+    else dbg.overlayStatus ??= 'ok';
+  } catch (e: any) {
+    dbg.overlayStatus ??= `not sent: ${e?.message ?? e}`;
+  }
 }
 
 /** "Meta+a" → "⌘+A", for the keys panel. */

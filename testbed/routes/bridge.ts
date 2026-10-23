@@ -29,8 +29,8 @@ post('/api/bridge/poll', (req) => {
   if (!allowed(req)) return;
   seenAt = Date.now();
   hello = req.json.hello ?? hello;
-  const running = req.json.running && jobs.get(req.json.running);
-  json(req, { job: queue.shift() ?? null, stop: !!running?.stop, runnerActive: Date.now() - runnerAt < RUNNER_ACTIVE_MS });
+  const running: string[] = Array.isArray(req.json.running) ? req.json.running : [];
+  json(req, { job: queue.shift() ?? null, stop: running.filter((id) => jobs.get(id)?.stop), runnerActive: Date.now() - runnerAt < RUNNER_ACTIVE_MS });
 });
 
 // FastPilot: log events for a job, and whether it has finished.

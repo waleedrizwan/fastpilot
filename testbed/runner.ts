@@ -1,7 +1,7 @@
 // Gauntlet runner: drives the FastPilot extension through the challenges and
 // collects the scores. It runs in your own Chrome without Chrome's debugging port:
 // each challenge is queued on the Gauntlet server, FastPilot (loaded unpacked from
-// dist/) picks it up, runs it in a tab you can watch, and posts its log back
+// dist/) picks it up, runs it in a minimized window (--show to watch), and posts its log back
 // (src/shared/bridge.ts). Results are read back from /api/results.
 //
 //   FASTPILOT_API_KEY=... npm run gauntlet -- --only supported --area lab:clicks
@@ -11,7 +11,7 @@
 // in memory only. It is never stored, written to the report or printed.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, styleText } from 'node:util';
@@ -22,8 +22,10 @@ import type { Attempt, Result, Status } from './lib/results.ts';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DIST = join(ROOT, 'dist');
 /** How long to wait after the agent stops for the page or server to report. */
-const REPORT_GRACE_MS = 1500;
-const REPORT_MAX_MS = 5000;
+const REPORT_GRACE_MS = 500;
+const REPORT_MAX_MS = 3000;
+/** Tasks that expect the person running them to have signed in as demo first. */
+const SIGNS_IN = /sign in as demo/i;
 const HELP = `Runs FastPilot through Gauntlet challenges and prints a summary.
 
 Usage: npm run gauntlet -- [options]
@@ -34,13 +36,17 @@ Choosing challenges (filters combine; lists can be comma-separated or repeated):
   --check <c>       auto, answer or handoff.
   --id <id>         A challenge id, an id prefix (lab/clicks) or a glob (lab/*/hover-*).
   --level <n>       1, 2 or 3.
+  --failed          Only challenges not passing on the scoreboard, to rerun what's still broken.
   --limit <n>       Run at most n challenges.
   --list            Print the selected challenges and exit.
 
 Running:
-  --timeout <s>     Per-challenge limit in seconds (default 180).
+  --timeout <s>     Per-challenge limit in seconds (default 60).
   --speed <s>       instant, fast or natural (default: the extension's setting).
-  --max-steps <n>   Agent step limit (default: the extension's setting).
+  --max-steps <n>   Agent step limit (default 20; almost every challenge that passes needs fewer).
+  --parallel <n>    Run up to n lab challenges at once (default 3). Lab challenges don't share any
+                    site state; the store, app and site challenges share one cart and sign-in, so they
+                    always run one at a time, first. 1 runs everything one at a time, as before.
   --replay          Allow saved-run replay. Off by default so every run asks the model.
   --jev <mode>      off, shadow (ask TypeSafe's Jev each turn and log its answer beside the model's)
                     or finish (also end the run when Jev is at least 90% sure it's done). Default:
@@ -48,18 +54,24 @@ Running:
   --keep-state      Don't reset the site's carts, orders and sign-ins before each challenge.
   --reset           Clear each challenge's old results first, so the scoreboard shows only this run.
   --verbose, -v     Print the agent's log as it runs.
+  --show            Run in a window you can watch, with the mouse and keys drawn on the page. By default
+                    tests run in a minimized window that never takes focus, with nothing drawn.
 
 Browser and site:
   Runs in your own Chrome, the one you browse with, with no prompts and no debugging port. Load
   dist/ there once with "Load unpacked" on chrome://extensions; that development build checks the
-  Gauntlet server for work every 30 s, runs each challenge in a tab you can watch, and closes only the
-  tabs it opened. Each run first reloads FastPilot so it runs the current build.
+  Gauntlet server for work every 30 s, runs each challenge in a tab in its own minimized window (see
+  --show), and closes only the tabs it opened. Each run first reloads FastPilot so it runs the current build.
   --base <url>      Gauntlet URL (default http://localhost:5175, the only address FastPilot polls).
                     Started in-process if it isn't running.
   --build, --no-build
                     Always or never run "npm run build" first. By default it builds when dist/ is
                     missing or older than src/.
-  --out <file>      Where to write the JSON report (default testbed/.data/runs/<time>.json).
+  --out <file>      Where to write the JSON report (default testbed/.data/runs/<time>.json). It's saved
+                    after every challenge, so a run that's cut short keeps what it finished.
+  --resume <file>   Carry on a run from its report: same challenges (unless you pick others), skipping
+                    the ones it already has, adding to the same report. Settings and limits are this
+                    run's, so a resumed run can use faster ones; the report lists each part's settings.
 
 Model (environment variables):
   FASTPILOT_API_KEY   API key. Falls back to OPENROUTER_API_KEY, OPENAI_API_KEY, GROQ_API_KEY or
@@ -80,19 +92,23 @@ const { values: opt } = parseArgs({
     check: { type: 'string', multiple: true },
     id: { type: 'string', multiple: true },
     level: { type: 'string', multiple: true },
+    failed: { type: 'boolean' },
     limit: { type: 'string' },
     list: { type: 'boolean' },
-    timeout: { type: 'string', default: '180' },
+    timeout: { type: 'string', default: '60' },
     speed: { type: 'string' },
-    'max-steps': { type: 'string' },
+    'max-steps': { type: 'string', default: '20' },
+    parallel: { type: 'string', default: '3' },
     replay: { type: 'boolean' },
     jev: { type: 'string' },
     'keep-state': { type: 'boolean' },
     reset: { type: 'boolean' },
     verbose: { type: 'boolean', short: 'v' },
+    show: { type: 'boolean' },
     base: { type: 'string' },
     build: { type: 'boolean' },
     out: { type: 'string' },
+    resume: { type: 'string' },
     help: { type: 'boolean', short: 'h' },
   },
 });
@@ -134,6 +150,7 @@ function select(all: ApiChallenge[]): ApiChallenge[] {
     (!only || (only === 'supported') === c.supported) &&
     (!checks.length || checks.includes(c.check)) &&
     (!levels.length || levels.includes(c.level)) &&
+    (!opt.failed || c.result.status !== 'pass') &&
     (!ids.length || ids.some((p) => idMatch(c.id, p))));
   return opt.limit ? picked.slice(0, Number(opt.limit)) : picked;
 }
@@ -248,11 +265,12 @@ function outcomeOf(c: ApiChallenge, server: Status, finish: Finish): Outcome {
   return finish === 'timeout' || finish === 'error' ? finish : 'fail';
 }
 
-interface Ctx { base: string; settings: Partial<Settings>; redact: (s: string) => string; job?: string }
+interface Ctx { base: string; settings: Partial<Settings>; redact: (s: string) => string; jobs: Set<string> }
 
-async function runOne(ctx: Ctx, c: ApiChallenge, onLog: (e: LogEvent) => void): Promise<RunResult> {
+/** `reset` resets the site's carts, orders and sign-ins first; off for runs alongside others. */
+async function runOne(ctx: Ctx, c: ApiChallenge, onLog: (e: LogEvent) => void, reset = true): Promise<RunResult> {
   const { base } = ctx;
-  if (!opt['keep-state']) await api(base, '/api/reset-site', {});
+  if (reset && !opt['keep-state']) await api(base, '/api/reset-site', {});
   if (opt.reset) await api(base, '/api/results/reset', { id: c.id });
   const seen = (await challengesFrom(base)).find((x) => x.id === c.id)!.result.attempts.length;
 
@@ -262,7 +280,7 @@ async function runOne(ctx: Ctx, c: ApiChallenge, onLog: (e: LogEvent) => void): 
   // would have once; without it the banner covers every store page and each answer counts as an attempt.
   const start = `${base}/challenges/start/${c.id}?agent=1${opt['keep-state'] ? '' : '&consent=necessary'}`;
   // Tasks that say "Sign in as demo first" expect the person running them to have done it.
-  const signedIn = /sign in as demo/i.test(c.task);
+  const signedIn = SIGNS_IN.test(c.task);
 
   const log: LogEvent[] = [];
   const onEvent = (e: LogEvent) => {
@@ -273,10 +291,10 @@ async function runOne(ctx: Ctx, c: ApiChallenge, onLog: (e: LogEvent) => void): 
   };
   const t0 = performance.now();
   const id = await enqueue(base, {
-    kind: 'run', task: c.task, settings: ctx.settings, confine: [base, OTHER_ORIGIN],
+    kind: 'run', task: c.task, settings: ctx.settings, confine: [base, OTHER_ORIGIN], hidden: !opt.show,
     urls: signedIn ? [`${base}/challenges/demo-signin`, start] : [start],
   });
-  ctx.job = id;
+  ctx.jobs.add(id);
   const logSeen = { n: 0 };
   const timedOut = !(await follow(base, id, Number(opt.timeout) * 1000, onEvent, logSeen));
   const ms = Math.round(performance.now() - t0);
@@ -289,7 +307,7 @@ async function runOne(ctx: Ctx, c: ApiChallenge, onLog: (e: LogEvent) => void): 
       await waitForFastPilot(base, 'Reloading FastPilot to end a task that ignored Stop…', at);
     }
   }
-  ctx.job = undefined;
+  ctx.jobs.delete(id);
 
   // Page scripts report a moment after the last action; give them time before closing the tab.
   let attempts: Attempt[] = [];
@@ -386,10 +404,11 @@ function printSummary(s: ReturnType<typeof summarize>, results: RunResult[]) {
   }
 }
 
-function printEvent(e: LogEvent) {
+/** `who` names the challenge when several run at once. */
+function printEvent(e: LogEvent, who = '') {
   const text = clip(e.kind === 'action' ? `→ ${e.text}` : e.text, 160);
   const ms = e.ms === undefined ? '' : styleText('dim', ` ${e.ms >= 1000 ? secs(e.ms) : `${e.ms}ms`}`);
-  console.log(`        ${e.kind === 'error' ? styleText('red', text) : e.kind === 'info' ? styleText('dim', text) : text}${ms}`);
+  console.log(`        ${who && styleText('dim', `${who} `)}${e.kind === 'error' ? styleText('red', text) : e.kind === 'info' ? styleText('dim', text) : text}${ms}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +452,8 @@ const KEY_ENV: [RegExp, string][] = [
 /** Settings for this run from the environment and flags. They override the extension's saved settings in memory only. */
 function settingsFromEnv(): Partial<Settings> {
   const env = process.env;
-  const s: Partial<Settings> = { replay: !!opt.replay };
+  // Nobody watches a hidden run, so don't draw the mouse and keys on its pages.
+  const s: Partial<Settings> = { replay: !!opt.replay, ...(!opt.show && { showInput: false }) };
   if (env.FASTPILOT_BASE_URL) s.baseUrl = env.FASTPILOT_BASE_URL;
   if (env.FASTPILOT_MODEL) s.model = env.FASTPILOT_MODEL;
   // Unset values come from the extension's saved settings in that Chrome.
@@ -474,8 +494,36 @@ async function main() {
   }
 }
 
+/** A report from an earlier run, as written below. */
+interface Report {
+  startedAt: string;
+  filters: { area: string[]; only?: string; check: string[]; id: string[]; level: string[]; limit?: string; failed?: boolean };
+  parts?: Part[];
+  results: RunResult[];
+}
+/** Each run that added to a report, with its own settings. */
+interface Part { startedAt: string; finishedAt?: string; settings: object; timeoutSec: number; parallel: number; ran: number }
+
+function loadReport(path: string): Report {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch (e: any) {
+    return fail(`Can't read the report to resume (${path}): ${e?.message ?? e}`);
+  }
+}
+
 async function mainWithSite(base: string) {
-  const picked = select(await challengesFrom(base));
+  const prior = opt.resume ? loadReport(opt.resume) : undefined;
+  // Resuming without choosing challenges picks the same ones the run started with.
+  if (prior && ![opt.area, opt.only, opt.check, opt.id, opt.level, opt.limit, opt.failed].some((v) => v !== undefined && !(Array.isArray(v) && !v.length))) {
+    const f = prior.filters;
+    Object.assign(opt, { area: f.area, only: f.only, check: f.check, id: f.id, level: f.level, limit: f.limit, failed: f.failed });
+  }
+  const done = new Map((prior?.results ?? []).map((r) => [r.id, r]));
+  const chosen = select(await challengesFrom(base));
+  const picked = chosen.filter((c) => !done.has(c.id));
+  if (prior) console.log(`Resuming ${opt.resume}: ${chosen.length - picked.length} of ${chosen.length} challenges already done.`);
+  if (prior && !picked.length) return void console.log('Nothing left to run.');
   if (!picked.length) fail('No challenges match those filters.');
   if (opt.list) {
     for (const c of picked) console.log(`${c.id.padEnd(44)} ${c.check.padEnd(8)} ${c.supported ? '         ' : 'gap probe'}  ${clip(c.task, 80)}`);
@@ -483,6 +531,8 @@ async function mainWithSite(base: string) {
   }
 
   if (!(Number(opt.timeout) > 0)) fail('--timeout takes a number of seconds.');
+  const parallel = Math.floor(Number(opt.parallel));
+  if (!(parallel >= 1)) fail('--parallel takes a number, 1 or more.');
   const settings = settingsFromEnv();
   const redact = (s: string) => (settings.apiKey ? s.split(settings.apiKey).join('[key]') : s);
   buildIfNeeded();
@@ -500,21 +550,42 @@ async function mainWithSite(base: string) {
   }
   let ctx: Ctx | undefined;
   let stopping = false;
+  /** Set when a run shows the rest can't succeed (a bad key or model). */
+  let halt = false;
   const onSigint = () => {
     if (stopping) process.exit(130);
     stopping = true;
     console.log(styleText('yellow', '\nStopping after this challenge (Ctrl-C again to quit now)…'));
-    if (ctx?.job) bridge(base, '/api/bridge/stop', { job: ctx.job }).catch(() => {});
+    for (const job of ctx?.jobs ?? []) bridge(base, '/api/bridge/stop', { job }).catch(() => {});
   };
   process.on('SIGINT', onSigint);
 
-  const results: RunResult[] = [];
+  const byId = new Map<string, RunResult>();
   const startedAt = new Date();
+  const out = opt.out ?? opt.resume ?? join(ROOT, 'testbed/.data/runs', `${startedAt.toISOString().replace(/[:.]/g, '-')}.json`);
+  const part: Part = { startedAt: startedAt.toISOString(), settings: {}, timeoutSec: Number(opt.timeout), parallel, ran: 0 };
+  const parts = [...(prior?.parts ?? []), part];
+  /** Everything so far, earlier runs' results first in challenge order. */
+  const allResults = () => chosen.flatMap((c) => byId.get(c.id) ?? done.get(c.id) ?? []);
+  const save = (finished = false) => {
+    const { hasKey: _k, ...model } = effective;
+    part.settings = model;
+    part.ran = byId.size;
+    if (finished) part.finishedAt = new Date().toISOString();
+    const results = allResults();
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, `${JSON.stringify({
+      startedAt: prior?.startedAt ?? startedAt.toISOString(), finishedAt: finished ? part.finishedAt : undefined, base, fastpilot: hello.version,
+      settings: model, timeoutSec: Number(opt.timeout), parallel,
+      filters: { area: list(opt.area), only: opt.only, check: list(opt.check), id: list(opt.id), level: list(opt.level), limit: opt.limit, failed: opt.failed },
+      parts, summary: summarize(results), results,
+    }, null, 1)}\n`);
+  };
   // What this run uses: FastPilot's saved settings, with anything given here on top.
   const { apiKey: _key, ...overrides } = settings;
   let effective = { ...hello.settings, ...overrides, hasKey: hello.hasKey || !!settings.apiKey };
   try {
-    ctx = { base, settings, redact };
+    ctx = { base, settings, redact, jobs: new Set() };
     // No key saved in FastPilot: fall back to the provider's own variable.
     const keyVar = !effective.hasKey && KEY_ENV.find(([re]) => re.test(effective.baseUrl))?.[1];
     if (keyVar && process.env[keyVar]) {
@@ -527,19 +598,23 @@ async function mainWithSite(base: string) {
     }
     console.log(`FastPilot ${hello.version} (build ${hello.build}) · your Chrome, through the Gauntlet bridge`);
     console.log(`Model ${effective.model} via ${effective.baseUrl} · speed ${effective.speed} · up to ${effective.maxSteps} steps · ${opt.timeout}s timeout${effective.jev !== 'off' ? ` · Jev ${effective.jev} (${effective.jevModel})` : ''}`);
-    console.log(`Running ${picked.length} challenge${picked.length === 1 ? '' : 's'} against ${base}\n`);
+    // Lab challenges keep no shared state, so several can run at once. The rest share one cart and
+    // sign-in and reset the site before each run, so they go one at a time, first.
+    const together = (c: ApiChallenge) => parallel > 1 && c.area.startsWith('lab') && !SIGNS_IN.test(c.task);
+    const alone = picked.filter((c) => !together(c)), pooled = picked.filter(together);
+    console.log(`Running ${picked.length} challenge${picked.length === 1 ? '' : 's'} against ${base}${pooled.length ? ` (${pooled.length} lab challenges up to ${parallel} at a time)` : ''}\n`);
 
     const pad = String(picked.length).length;
-    for (const [i, c] of picked.entries()) {
-      if (stopping) break;
-      const tag = `[${String(i + 1).padStart(pad)}/${picked.length}]`;
-      if (opt.verbose) console.log(`${tag} ${c.id}  ${styleText('dim', clip(c.task, 100))}`);
-      const r = await runOne(ctx, c, opt.verbose ? printEvent : () => {});
+    let finished = 0;
+    /** Prints a finished run and keeps it. Returns false when the run should stop. */
+    const record = (r: RunResult): boolean => {
+      const tag = `[${String(++finished).padStart(pad)}/${picked.length}]`;
       if (stopping && r.finish === 'error') {
         console.log(`${opt.verbose ? '       ' : tag} ${styleText('yellow', 'stopped')}  ${r.id}`);
-        break;
+        return false;
       }
-      results.push(r);
+      byId.set(r.id, r);
+      save();
       const detail = [
         r.finish, secs(r.ms), `${r.steps} step${r.steps === 1 ? '' : 's'}`, `model ${secs(r.modelMs)}`,
         r.tokens && `${((r.tokens.input + r.tokens.output) / 1000).toFixed(1)}k tokens`, r.marked && `marked ${r.marked}`,
@@ -548,26 +623,39 @@ async function mainWithSite(base: string) {
       // A bad key or model fails every challenge the same way; stop early.
       if (r.finish === 'error' && /Model API (401|402|403|404)|Set a model|Add your API key/.test(r.text)) {
         console.error(styleText('red', `\n${r.text}`));
-        break;
+        return false;
       }
+      return true;
+    };
+    const go = () => !stopping && !halt;
+
+    for (const c of alone) {
+      if (!go()) break;
+      if (opt.verbose) console.log(`${c.id}  ${styleText('dim', clip(c.task, 100))}`);
+      if (!record(await runOne(ctx, c, opt.verbose ? (e) => printEvent(e) : () => {}))) halt = true;
+    }
+    if (pooled.length && go()) {
+      if (!opt['keep-state']) await api(base, '/api/reset-site', {});
+      let next = 0;
+      const lane = async () => {
+        while (go() && next < pooled.length) {
+          const c = pooled[next++];
+          if (opt.verbose) console.log(`${c.id}  ${styleText('dim', clip(c.task, 100))}`);
+          if (!record(await runOne(ctx!, c, opt.verbose ? (e) => printEvent(e, c.id) : () => {}, false))) halt = true;
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(parallel, pooled.length) }, lane));
     }
   } finally {
     process.off('SIGINT', onSigint);
     // This is your own browser: show the challenge status again.
-    await enqueue(base, { kind: 'visit', url: `${base}/challenges/agent-off` }).then((id) => follow(base, id, 15_000)).catch(() => {});
+    await enqueue(base, { kind: 'visit', url: `${base}/challenges/agent-off`, hidden: !opt.show }).then((id) => follow(base, id, 15_000)).catch(() => {});
   }
 
-  if (!results.length) return;
-  const summary = summarize(results);
-  printSummary(summary, results);
-  const out = opt.out ?? join(ROOT, 'testbed/.data/runs', `${startedAt.toISOString().replace(/[:.]/g, '-')}.json`);
-  mkdirSync(dirname(out), { recursive: true });
-  const { hasKey: _k, ...model } = effective;
-  writeFileSync(out, `${JSON.stringify({
-    startedAt: startedAt.toISOString(), finishedAt: new Date().toISOString(), base, fastpilot: hello.version,
-    settings: model, timeoutSec: Number(opt.timeout), filters: { area: list(opt.area), only: opt.only, check: list(opt.check), id: list(opt.id), level: list(opt.level), limit: opt.limit },
-    summary, results,
-  }, null, 1)}\n`);
+  if (!byId.size) return;
+  save(!stopping && !halt);
+  const results = allResults();
+  printSummary(summarize(results), results);
   const shown = relative(process.cwd(), out);
   console.log(`\nReport: ${shown.startsWith('..') ? out : shown}`);
 }

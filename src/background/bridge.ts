@@ -12,8 +12,7 @@ const POLL_MS = 400;
 export const BRIDGE_ALARM = 'gauntlet-bridge';
 
 export interface BridgeHost {
-  run(task: string, emit: (e: LogEvent) => void, opts: { tabId: number; settings: Partial<Settings> }): Promise<void>;
-  stop(): void;
+  run(task: string, emit: (e: LogEvent) => void, opts: { tabId: number; settings: Partial<Settings>; signal: AbortSignal }): Promise<void>;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -22,9 +21,11 @@ const STARTED = Date.now();
 let polling = false;
 /** Set once a reload is under way, so this copy takes no more jobs. */
 let reloading = false;
-let running: string | null = null;
-/** For each finished run job, the tabs that existed before it and its own tab, until its close job. */
-const opened = new Map<string, { before: number[]; tabId: number | null; confine: string[] }>();
+/** Run jobs in progress (the runner may run several at once), each with its Stop. */
+const running = new Map<string, AbortController>();
+type Opened = { before: number[]; tabId: number | null; confine: string[] };
+/** For each run job, the tabs that existed before it and its own tab, until its close job. */
+const opened = new Map<string, Opened>();
 
 async function post<T = any>(path: string, body: unknown): Promise<T> {
   const res = await fetch(BRIDGE_BASE + path, {
@@ -58,9 +59,9 @@ export async function pollBridge(host: BridgeHost): Promise<void> {
     while (!reloading && Date.now() - activeAt < IDLE_MS) {
       // An extension API call each round keeps the service worker awake while it polls.
       await chrome.runtime.getPlatformInfo();
-      const r = await post<{ job: BridgeJob | null; stop: boolean; runnerActive: boolean }>('/api/bridge/poll', { hello: await hello(), running });
-      if (r.runnerActive || r.job || running) activeAt = Date.now();
-      if (r.stop && running) host.stop();
+      const r = await post<{ job: BridgeJob | null; stop: string[]; runnerActive: boolean }>('/api/bridge/poll', { hello: await hello(), running: [...running.keys()] });
+      if (r.runnerActive || r.job || running.size) activeAt = Date.now();
+      for (const id of r.stop) running.get(id)?.abort();
       if (r.job) void handle(host, r.job);
       await sleep(POLL_MS);
     }
@@ -74,6 +75,13 @@ export async function pollBridge(host: BridgeHost): Promise<void> {
 async function handle(host: BridgeHost, job: BridgeJob): Promise<void> {
   if (job.kind === 'reload') {
     reloading = true;
+    // The reload forgets which tabs runs opened, so close them now: a run that timed out would
+    // otherwise leave its page running in the background for the rest of the test run.
+    for (const o of opened.values()) await closeTabs(o);
+    opened.clear();
+    // Runs in progress end with the reload; say so, so the runner isn't left waiting for them.
+    await Promise.all([...running.keys()].map((id) =>
+      post('/api/bridge/event', { job: id, events: [{ kind: 'error', text: 'bridge: FastPilot was reloaded' }], done: true }).catch(() => {})));
     await post('/api/bridge/event', { job: job.id, done: true }).catch(() => {});
     chrome.runtime.reload();
     return;
@@ -81,23 +89,19 @@ async function handle(host: BridgeHost, job: BridgeJob): Promise<void> {
   if (job.kind === 'close') {
     const o = opened.get(job.run);
     opened.delete(job.run);
-    if (o) {
-      // Only the tabs that run opened on the test site, plus its own tab.
-      const extra = (await chrome.tabs.query({})).filter((t) => !o.before.includes(t.id!) && (t.id === o.tabId
-        || !t.url || t.url === 'about:blank' || o.confine.some((origin) => t.url!.startsWith(origin))));
-      if (extra.length) await chrome.tabs.remove(extra.map((t) => t.id!)).catch(() => {});
-    }
+    if (o) await closeTabs(o);
     await post('/api/bridge/event', { job: job.id, done: true }).catch(() => {});
     return;
   }
   if (job.kind === 'visit') {
-    const tabId = await openInAgentWindow(job.url);
+    const tabId = await openInAgentWindow(job.url, null, job.hidden);
     await chrome.tabs.remove(tabId).catch(() => {});
     await post('/api/bridge/event', { job: job.id, done: true }).catch(() => {});
     return;
   }
 
-  running = job.id;
+  const stop = new AbortController();
+  running.set(job.id, stop);
   // Events go out in order, batched while a post is in flight.
   let pending: LogEvent[] = [];
   let chain: Promise<unknown> = Promise.resolve();
@@ -113,16 +117,32 @@ async function handle(host: BridgeHost, job: BridgeJob): Promise<void> {
     pending.push(e);
     void flush();
   };
-  const before = (await chrome.tabs.query({})).map((t) => t.id!);
-  let tabId: number | null = null;
+  // Recorded before the run starts, so a reload during the run can still close its tabs.
+  const o: Opened = { before: (await chrome.tabs.query({})).map((t) => t.id!), tabId: null, confine: job.confine };
+  opened.set(job.id, o);
   try {
-    for (const url of job.urls) tabId = await openInAgentWindow(url, tabId);
-    await host.run(job.task, emit, { tabId: tabId!, settings: { ...job.settings, confine: job.confine } });
+    for (const url of job.urls) o.tabId = await openInAgentWindow(url, o.tabId, job.hidden);
+    await host.run(job.task, emit, { tabId: o.tabId!, settings: { ...job.settings, confine: job.confine }, signal: stop.signal });
   } catch (e: any) {
     emit({ kind: 'error', text: `bridge: ${e?.message ?? e}` });
   } finally {
-    opened.set(job.id, { before, tabId, confine: job.confine });
-    running = null;
+    running.delete(job.id);
     await flush(true);
   }
+}
+
+/**
+ * Closes the tabs a run opened on the test site, plus its own tab. Tabs of other runs still in
+ * progress, and the tabs they opened, are left alone.
+ */
+async function closeTabs(o: Opened): Promise<void> {
+  const tabs = await chrome.tabs.query({});
+  const others = new Set([...opened.values()].filter((x) => x !== o && x.tabId !== null).map((x) => x.tabId!));
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const t of tabs) if (t.openerTabId !== undefined && others.has(t.openerTabId) && !others.has(t.id!)) { others.add(t.id!); grew = true; }
+  }
+  const extra = tabs.filter((t) => !o.before.includes(t.id!) && !others.has(t.id!) && (t.id === o.tabId
+    || !t.url || t.url === 'about:blank' || o.confine.some((origin) => t.url!.startsWith(origin))));
+  if (extra.length) await chrome.tabs.remove(extra.map((t) => t.id!)).catch(() => {});
 }

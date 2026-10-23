@@ -11,11 +11,11 @@ export const BRIDGE_HEADER = 'X-Gauntlet-Bridge';
 
 export type BridgeJob =
   /** Opens `urls` in turn in one new tab and runs `task` there. */
-  | { id: string; kind: 'run'; task: string; urls: string[]; settings: Partial<Settings>; confine: string[] }
+  | { id: string; kind: 'run'; task: string; urls: string[]; settings: Partial<Settings>; confine: string[]; hidden?: boolean }
   /** Closes the tabs run job `run` opened on its `confine` origins, once the page has reported its result. */
   | { id: string; kind: 'close'; run: string }
   /** Opens `url` in a background tab and closes it once loaded, for its cookies. */
-  | { id: string; kind: 'visit'; url: string }
+  | { id: string; kind: 'visit'; url: string; hidden?: boolean }
   /** Reloads FastPilot from its folder, so it runs the latest build. */
   | { id: string; kind: 'reload' };
 

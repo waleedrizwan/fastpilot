@@ -6,14 +6,23 @@ import { isAgentWindow, openInAgentWindow } from './window';
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
+/** The task started from the side panel. Only one at a time. */
 let current: Agent | null = null;
+/** Every running task, including Gauntlet runs, which may run several at once in their own tabs. */
+const active = new Set<Agent>();
 
-/** Runs one task. `opts` is only used by the Gauntlet bridge below: a fixed tab, and settings for this run only. */
-async function runTask(task: string, emit: (e: LogEvent) => void, opts: { tabId?: number; settings?: Partial<Settings> } = {}) {
-  if (current) return emit({ kind: 'error', text: 'A task is already running.' });
+/**
+ * Runs one task. `opts` is only used by the Gauntlet bridge below: a fixed tab, settings for this run
+ * only, and a signal that stops this run alone.
+ */
+async function runTask(task: string, emit: (e: LogEvent) => void, opts: { tabId?: number; settings?: Partial<Settings>; signal?: AbortSignal } = {}) {
+  const bridged = opts.tabId !== undefined;
+  if (current || (!bridged && active.size)) return emit({ kind: 'error', text: 'A task is already running.' });
   const settings = { ...(await loadSettings()), ...opts.settings };
   const agent = new Agent(settings, emit);
-  current = agent;
+  if (!bridged) current = agent;
+  active.add(agent);
+  opts.signal?.addEventListener('abort', () => agent.stop());
   try {
     let tabId = opts.tabId;
     if (tabId === undefined && settings.ownWindow) {
@@ -26,14 +35,15 @@ async function runTask(task: string, emit: (e: LogEvent) => void, opts: { tabId?
   } catch (e: any) {
     emit({ kind: 'error', text: e?.name === 'AbortError' ? 'Stopped' : String(e?.message ?? e) });
   } finally {
-    current = null;
+    if (current === agent) current = null;
+    active.delete(agent);
     emit({ kind: 'idle', text: '' });
   }
 }
 
 // Gauntlet bridge for the test runner (testbed/runner.ts): development builds poll the local Gauntlet
 // server for tasks, so tests run in this Chrome without its debugging port. Settings passed in are never saved.
-const bridge: BridgeHost = { run: runTask, stop: () => current?.stop() };
+const bridge: BridgeHost = { run: runTask };
 isDevBuild().then((dev) => {
   if (!dev) return;
   chrome.alarms.create(BRIDGE_ALARM, { periodInMinutes: 0.5 });
@@ -52,7 +62,7 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onMessage.addListener(async (msg: PanelMsg) => {
     if (msg.type === 'stop') {
-      current?.stop();
+      for (const a of active) a.stop();
     } else if (msg.type === 'run') {
       await runTask(msg.task, emit);
     } else if (msg.type === 'snapshot') {
